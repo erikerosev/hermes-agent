@@ -424,6 +424,12 @@ def _resolve_runtime_from_pool_entry(
     elif provider == "qwen-oauth":
         api_mode = "chat_completions"
         base_url = base_url or DEFAULT_QWEN_BASE_URL
+    elif provider == "claude-cli":
+        # Claude Code CLI subprocess provider — no HTTP endpoint. Marker
+        # base_url (mint a copilot-acp acp://copilot) hogy a resolver
+        # üres-base_url checkjén átjusson; a claude_cli runner ignorálja.
+        api_mode = "claude_cli"
+        base_url = base_url or "claude://code"
     elif provider == "minimax-oauth":
         # MiniMax OAuth tokens are valid only against the Anthropic Messages
         # compatible endpoint. Do not honor stale model.api_mode values from a
@@ -1566,6 +1572,21 @@ def resolve_runtime_provider(
             "base_url": "moa://local",
             "api_key": "moa-virtual-provider",
             "source": "moa-virtual-provider",
+            "requested_provider": requested_provider,
+        }
+
+    # Claude Code CLI short-circuit: subprocess-based, no API key or base URL.
+    # The agent uses ClaudeCliRunner to shell out to `claude -p`.
+    if requested_provider in {"claude-cli", "claude-code-cli", "cc"}:
+        return {
+            "provider": "claude-cli",
+            "api_mode": "claude_cli",
+            # Marker base_url (mint a copilot-acp acp://copilot) — subprocess-based,
+            # a ClaudeCliRunner ignorálja; csak a resolver üres-base_url checkjén
+            # (cli.py:4241) jut át vele. PR #40528 itt üresen hagyta → smoke-teszt-bug.
+            "base_url": "claude://code",
+            "api_key": "not-needed",
+            "source": "claude-cli",
             "requested_provider": requested_provider,
         }
 
