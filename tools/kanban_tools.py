@@ -666,6 +666,21 @@ def _handle_complete(args: dict, **kw) -> str:
                 return tool_error(
                     f"could not complete {tid} (unknown id or already terminal)"
                 )
+            # Self-improvement: distill this completed task's durable lesson into the
+            # project naplo.md. Background + non-blocking — never delays the tool reply.
+            try:
+                import threading
+
+                def _bg_review() -> None:
+                    try:
+                        from hermes_cli import kanban_review
+                        kanban_review.review_pending()
+                    except Exception:
+                        pass
+
+                threading.Thread(target=_bg_review, name="kanban-review", daemon=True).start()
+            except Exception:
+                pass
             run = kb.latest_run(conn, tid)
             return _ok(task_id=tid, run_id=run.id if run else None)
         finally:

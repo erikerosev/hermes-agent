@@ -61,6 +61,8 @@ _HERMES_CORE_TOOLS = [
     "session_search",
     # Clarifying questions
     "clarify",
+    # Async human approval for risky actions (Apollo push/control gate)
+    "request_approval",
     # Code execution + delegation
     "execute_code", "delegate_task",
     # Cronjob management
@@ -236,7 +238,13 @@ TOOLSETS = {
         "tools": ["clarify"],
         "includes": []
     },
-    
+
+    "approval": {
+        "description": "Request async human approve/deny for risky actions via Apollo push + control card",
+        "tools": ["request_approval"],
+        "includes": []
+    },
+
     "code_execution": {
         "description": "Run Python scripts that call tools programmatically (reduces LLM round trips)",
         "tools": ["execute_code"],

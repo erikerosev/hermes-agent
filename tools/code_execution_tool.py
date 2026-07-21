@@ -1068,8 +1068,12 @@ def _execute_remote(
         # Execute the script on the remote backend
         logger.info("Executing code on %s backend (task %s)...",
                      env_type, effective_task_id[:8])
+        # Merge stderr into stdout (2>&1) so a Python traceback actually REACHES the
+        # model. Previously stderr went to the backend's discard, so a remote script
+        # that raised returned only "Script exited with code 1" with no traceback —
+        # the model couldn't see what failed (the local path already merges stderr).
         script_result = env.execute(
-            f"cd {quoted_sandbox_dir} && {env_prefix} python3 script.py",
+            f"cd {quoted_sandbox_dir} && {env_prefix} python3 script.py 2>&1",
             timeout=timeout,
         )
 
