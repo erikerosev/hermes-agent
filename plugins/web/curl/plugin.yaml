@@ -1,0 +1,7 @@
+name: web-curl
+version: 1.0.0
+description: "Direct HTTP fetch + HTML-to-text extraction (httpx + lxml). No API key, no cost, no external service. Handles ordinary pages; login/bot-walled sites are reported as blocked so the agent can fall back to browser_navigate."
+author: local
+kind: backend
+provides_web_providers:
+  - curl
