@@ -2466,7 +2466,20 @@ def _resolve_custom_runtime() -> Tuple[Optional[str], Optional[str], Optional[st
     This covers both env-driven OPENAI_BASE_URL setups and config-saved custom
     endpoints where the base URL lives in config.yaml instead of the live
     environment.
+
+    Apollo override: a dedicated ``HERMES_AUX_BASE_URL`` (+ ``HERMES_AUX_API_KEY``,
+    optional ``HERMES_AUX_API_MODE``) pins the auxiliary endpoint explicitly, so a
+    Claude-only (claude-cli) install routes side-tasks (compression, summaries,
+    naplo) back through its OWN gateway (claude-cli has no aux client of its own,
+    and the OpenRouter fallback is gone). Distinct from OPENAI_BASE_URL so it does
+    not perturb the main "custom" provider path.
     """
+    _aux_base = os.getenv("HERMES_AUX_BASE_URL", "").strip().rstrip("/")
+    if _aux_base:
+        _aux_key = os.getenv("HERMES_AUX_API_KEY", "").strip() or "no-key-required"
+        _aux_mode = os.getenv("HERMES_AUX_API_MODE", "").strip() or None
+        return _aux_base, _aux_key, _aux_mode
+
     try:
         from hermes_cli.runtime_provider import resolve_runtime_provider
 
@@ -2573,7 +2586,16 @@ def _try_custom_endpoint() -> Tuple[Optional[Any], Optional[str]]:
         return None, None
     if custom_base.lower().startswith(_CODEX_AUX_BASE_URL.lower()):
         return None, None
-    model = _read_main_model() or "gpt-4o-mini"
+    # Apollo aux-gateway: a claude-only install a side-taskeket a SAJÁT gateway-ére
+    # (HERMES_AUX_BASE_URL=:8642/v1) küldi. Ha a fő modell nevét küldenénk, a gateway
+    # TELJES agent-turnként szolgálná ki (persona + 2× MCP-spawn + memória) — ez az
+    # aux-önrekurzió, ami megfojtotta a gateway-t. Ehelyett a könnyű-út sentinelt küldjük
+    # (apollo-aux:sonnet): a gateway persona/MCP/memória nélkül, szemafor mögött szolgál.
+    _apollo_aux = os.getenv("HERMES_AUX_BASE_URL", "").strip().rstrip("/")
+    if _apollo_aux and custom_base.rstrip("/") == _apollo_aux:
+        model = os.getenv("HERMES_AUX_SENTINEL_MODEL", "apollo-aux:sonnet")
+    else:
+        model = _read_main_model() or "gpt-4o-mini"
     logger.debug("Auxiliary client: custom endpoint (%s, api_mode=%s)", model, custom_mode or "chat_completions")
     _clean_base, _dq = _extract_url_query_params(custom_base)
     _extra = {"default_query": _dq} if _dq else {}
@@ -4395,6 +4417,20 @@ def _resolve_auto(
     """
     global auxiliary_is_nous, _stale_base_url_warned
     auxiliary_is_nous = False  # Reset — _try_nous() will set True if it wins
+
+    # ── Apollo aux-gateway short-circuit ──
+    # Ha explicit aux-gateway van (HERMES_AUX_BASE_URL=:8642/v1), az MINDEN text-aux
+    # task (compression, recall, cím, session_search, napló…) elsődleges backendje. A
+    # claude-cli fő providernek NINCS saját aux-kliense (Step-1 alább "unhandled
+    # auth_type"-tal bukna), a named fallbackek (openrouter/nous) pedig halottak ennél a
+    # telepítésnél → különben minden aux-hívás fölöslegesen végigjárná a doomed
+    # openrouter→nous detourt. Egyből a custom endpointra (a _try_custom_endpoint az
+    # apollo-aux sentinelt küldi → könnyű-út MCP/persona/hook nélkül, se aux-önrekurzió).
+    if os.getenv("HERMES_AUX_BASE_URL", "").strip():
+        _apollo_client, _apollo_model = _try_custom_endpoint()
+        if _apollo_client is not None:
+            return _apollo_client, _apollo_model
+
     runtime = _normalize_main_runtime(main_runtime)
     runtime_provider = runtime.get("provider", "")
     runtime_model = str(runtime.get("model") or "")
