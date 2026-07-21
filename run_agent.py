@@ -6431,6 +6431,479 @@ class AIAgent:
         from agent.codex_runtime import run_codex_app_server_turn
         return run_codex_app_server_turn(self, user_message=user_message, original_user_message=original_user_message, messages=messages, effective_task_id=effective_task_id, should_review_memory=should_review_memory)
 
+    def _run_claude_cli_turn(
+        self,
+        *,
+        user_message: str,
+        original_user_message: Any,
+        messages: List[Dict[str, Any]],
+        effective_task_id: str,
+        should_review_memory: bool = False,
+    ) -> Dict[str, Any]:
+        """Run a full turn via Claude Code CLI subprocess.
+
+        CC handles its own tool execution (Read, Edit, Bash, etc.) internally.
+        We send the prompt + Hermes context, collect stream events, normalize
+        the response, and return in the standard conversation result format.
+
+        Context injection strategy (mirrors Hermes standard loop):
+          - Stable tier: written to .hermes.md in working_dir (CC auto-discovers)
+          - Volatile tier: --append-system-prompt (built-in memory, user profile, timestamp)
+          - External memory: injected into user message (fenced, preserves prefix cache)
+        """
+        from agent.claude_cli_runner import ClaudeCliRunner
+        from agent.memory_manager import build_memory_context_block
+        from agent.transports import get_transport
+
+        transport = get_transport("claude_cli")
+        working_dir = getattr(self, "_claude_cli_working_dir", None)
+
+        # ── Könnyű aux-út ────────────────────────────────────────
+        # A side-taskek (tömörítés, napló, kozos-konszolidáció, garden-kutatás,
+        # cím-generálás) csak egy olcsó, egylövetű LLM-választ kérnek — NEM az
+        # Apollo-personát, NEM MCP-toolokat, NEM memóriát/multi-turn kontextust.
+        # Ezért a gateway őket `_aux_lightweight` agenttel futtatja:
+        #   • nincs stable/volatile/external persona-kontextus (csak a HÍVÓ saját
+        #     system-üzenete = ephemeral_system_prompt marad, pl. a merge-szabályok),
+        #   • nincs MCP (no_mcp=True) → nincs per-hívás 2× MCP-spawn (ez fojtotta a
+        #     gateway-t, amikor sok aux-turn torlódott),
+        #   • mindig friss stateless (nincs persist/resume), olcsó/gyors modell (haiku),
+        #   • NEM fut memory-sync / naplo / skill_capture / on_session_end hook →
+        #     az aux-turn nem trigger újabb aux-turnt (nincs rekurzió),
+        #   • NEM perzisztálódik a state.db-be (nincs aux-szemét a thread-historyban).
+        # Ez orvosolja az aux-önrekurziót: az aux-hívás már nem teljes agent-turn.
+        if bool(getattr(self, "_aux_lightweight", False)):
+            _aux_model = getattr(self, "_aux_model", None) or "haiku"
+            api_kwargs = transport.build_kwargs(
+                model=_aux_model,
+                messages=messages + [{"role": "user", "content": user_message}],
+                working_dir=working_dir,
+                session_id=None,
+                timeout=getattr(self, "timeout_seconds", 120),
+            )
+            runner = ClaudeCliRunner(
+                command=getattr(self, "_claude_cli_command", "claude"),
+                working_dir=api_kwargs.get("working_dir"),
+            )
+
+            def _aux_on_delta(text):
+                cb = self.stream_delta_callback
+                if cb:
+                    try:
+                        cb(text)
+                    except Exception:
+                        pass
+
+            from agent.claude_process_manager import _render_history
+            _preamble = _render_history(messages)
+            _aux_prompt = (_preamble + api_kwargs["prompt"]) if _preamble else api_kwargs["prompt"]
+            events = asyncio.run(runner.run(
+                prompt=_aux_prompt,
+                model=api_kwargs["model"],
+                append_system_prompt=(self.ephemeral_system_prompt or None),  # CSAK a hívó instrukciója
+                session_id=None,
+                timeout=api_kwargs.get("timeout") or 120,
+                on_delta=_aux_on_delta,
+                thinking_tokens=0,
+                no_mcp=True,
+            ))
+            normalized = transport.normalize_response(events)
+            if self.stream_delta_callback:
+                try:
+                    if normalized.content:
+                        self.stream_delta_callback(normalized.content)
+                    self.stream_delta_callback(None)
+                except Exception:
+                    pass
+            return {
+                "final_response": normalized.content,
+                "messages": messages,
+                "api_calls": 1,
+                "completed": normalized.finish_reason != "error",
+                "error": normalized.provider_data.get("error") if normalized.provider_data else None,
+            }
+
+        # ── 1. Build stable Hermes context ───────────────────────
+        # CC doesn't auto-discover .hermes.md — only CLAUDE.md/AGENTS.md.
+        # We build the stable context (identity, skills, guidance) and
+        # inject it via --append-system-prompt alongside the volatile tier.
+        stable_context = self._build_hermes_cc_context(working_dir)
+
+        # ── 2. Build volatile system prompt ────────────────────────
+        # Built-in memory snapshot + user profile + timestamp.
+        # These change per-session but not per-turn.
+        volatile_parts = []
+        _memory_store = getattr(self, "_memory_store", None)
+        if _memory_store:
+            mem_snapshot = _memory_store.format_for_system_prompt("memory")
+            if mem_snapshot:
+                volatile_parts.append(mem_snapshot)
+            user_snapshot = _memory_store.format_for_system_prompt("user")
+            if user_snapshot:
+                volatile_parts.append(user_snapshot)
+
+        # External memory provider system prompt block
+        if self._memory_manager:
+            try:
+                provider_block = self._memory_manager.build_system_prompt()
+                if provider_block:
+                    volatile_parts.append(provider_block)
+            except Exception:
+                pass
+
+        # Timestamp + session info
+        from datetime import datetime
+        volatile_parts.append(f"Conversation started: {datetime.now().strftime('%A, %B %d, %Y')}")
+        if self.session_id:
+            volatile_parts.append(f"Session ID: {self.session_id}")
+        volatile_parts.append(f"Model: {self.model}")
+
+        volatile_prompt = "\n\n".join(volatile_parts) if volatile_parts else None
+
+        # ── Combine stable + volatile into single append prompt ───
+        append_system_prompt = "\n\n".join(
+            p for p in (stable_context, volatile_prompt) if p
+        ) or None
+
+        # ── 3. Prefetch external memory and inject into prompt ─────
+        # Following Hermes convention: external memory goes into the
+        # user message (fenced), not the system prompt.
+        prompt = user_message
+        if self._memory_manager:
+            try:
+                self._memory_manager.on_turn_start(
+                    getattr(self, "_user_turn_count", 0),
+                    original_user_message if isinstance(original_user_message, str) else "",
+                )
+                query = original_user_message if isinstance(original_user_message, str) else ""
+                prefetched = self._memory_manager.prefetch_all(query) or ""
+                if prefetched:
+                    fenced = build_memory_context_block(prefetched)
+                    if fenced:
+                        prompt = f"{user_message}\n\n{fenced}"
+            except Exception:
+                pass
+
+        # ── 4. Build kwargs via transport and run CLI ──────────────
+        api_kwargs = transport.build_kwargs(
+            model=self.model,
+            messages=messages + [{"role": "user", "content": prompt}],
+            working_dir=working_dir,
+            session_id=getattr(self, "_claude_cli_session_id", None),
+            timeout=getattr(self, "timeout_seconds", 600),
+        )
+
+        runner = ClaudeCliRunner(
+            command=getattr(self, "_claude_cli_command", "claude"),
+            working_dir=api_kwargs.get("working_dir"),
+        )
+
+        # Streaming: a runner az inkrementális text-deltákat ezen a callbacken
+        # adja át, ahogy érkeznek (gépelő-effekt + hang). Hibatűrő.
+        _streamed = {"any": False}
+
+        def _on_delta(text):
+            cb = self.stream_delta_callback
+            if cb:
+                try:
+                    cb(text)
+                    _streamed["any"] = True
+                except Exception:
+                    pass
+
+        # OPT-IN persistent-process út (HERMES_CLAUDE_PERSIST): a per-session live
+        # claude-processz nem fizeti a ~7s indítást turn 2+-on. Egyébként a bevált
+        # spawn-per-turn (a fenti `runner`), default fallback → nulla regresszió.
+        # Fázis-jelzés a frontendnek (VALÓDI állapot): a manager "starting"-ot küld cold-
+        # spawnkor, "thinking"-et a prompt elküldése után (az első tokenig). A gateway
+        # status_callback-je SSE-re teszi (event: hermes.status). Hibatűrő.
+        def _on_status(phase, label=None):
+            cb = getattr(self, "status_callback", None)
+            if cb:
+                try:
+                    cb(phase, label)
+                except Exception:
+                    pass
+
+        # Élő gondolatmenet (extended thinking): a model thinking-deltáit a frontendre
+        # streameljük (event: hermes.thinking → összecsukható „Gondolkodik" panel).
+        def _on_thinking(text):
+            cb = getattr(self, "thinking_callback", None)
+            if cb and text:
+                try:
+                    cb(text)
+                except Exception:
+                    pass
+
+        # Élő tool-státusz (claude-cli): a claude a toolokat a saját subprocesszében
+        # futtatja, a stream-json viszont hordozza a tool_use / tool_result blokkokat.
+        # Ezeket a natív loop tool-callbackjeinek FORMÁJÁRA fordítjuk (id, name, args) /
+        # (id, name, args, result) → a gateway ugyanúgy hermes.tool.progress SSE-t emittál
+        # → a fenris „🔧 fut: …" pulse-t mutat. Enélkül a claude-cli út csak text+thinking-et
+        # adott, tool-státuszt nem (a felhasználó nem látta, „épp mi történik"). Dedup
+        # tool_id-ra (a partial+komplett assistant-üzenet ne tüzeljen kétszer). Hibatűrő.
+        _cli_tool_meta: dict = {}
+
+        def _on_tool_use(tu):
+            tid = getattr(tu, "tool_id", "") or ""
+            if not tid or tid in _cli_tool_meta:
+                return
+            _cli_tool_meta[tid] = (tu.tool_name, tu.tool_input)
+            cb = getattr(self, "tool_start_callback", None)
+            if cb:
+                try:
+                    cb(tid, tu.tool_name, tu.tool_input)
+                except Exception:
+                    pass
+
+        def _on_tool_result(tid, content):
+            if not tid:
+                return
+            name, targs = _cli_tool_meta.get(tid, ("", {}))
+            cb = getattr(self, "tool_complete_callback", None)
+            if cb:
+                try:
+                    cb(tid, name, targs, content)
+                except Exception:
+                    pass
+
+        from agent.claude_process_manager import enabled as _persist_on, get_manager
+        if _persist_on():
+            events = get_manager().run_turn(
+                session_id=self.session_id or api_kwargs.get("session_id"),
+                prompt=api_kwargs["prompt"],
+                model=api_kwargs["model"],
+                append_system_prompt=append_system_prompt,
+                working_dir=api_kwargs.get("working_dir"),
+                on_delta=_on_delta,
+                on_status=_on_status,
+                on_thinking=_on_thinking,
+                on_tool_use=_on_tool_use,
+                on_tool_result=_on_tool_result,
+                timeout=api_kwargs.get("timeout") or 600,
+                # Per-request thinking-budget (UI-kapcsoló) — a spawn-kor dől el; toggle-
+                # váláskor a manager recycle-öli a processzt.
+                thinking_tokens=getattr(self, "_thinking_tokens", None),
+                # A szál előzménye (state.db-ből). Egy FRISS processzt ezzel töltünk fel,
+                # hogy restart/respawn után se vesszen el a kontextus (a transport prompt-ja
+                # csak az utolsó üzenet — a history-t a live processz tartotta eddig).
+                history=messages,
+                stable_system_prompt=stable_context,  # prewarm: a standby a STABIL personát kapja
+            )
+        else:
+            _on_status("thinking")  # spawn-per-turn: a model indul, jelezzük
+            # STATELESS út: minden turn FRISS claude-processzt indít, ezért a teljes
+            # beszélgetés-előzményt (a gateway által a state.db-ből betöltött `messages`)
+            # a prompt elé rendereljük — különben a build_kwargs csak az utolsó üzenetet
+            # adná át, és elveszne a kontextus. Nincs felhalmozó élő processz → nincs
+            # "X üzenet után elfelejt válaszolni", és a gateway-leállás is tiszta.
+            # --resume: ha van már claude-session ehhez a threadhez, claude a SAJÁT
+            # lemez-session-jéből tölti a kontextust → CSAK az új üzenetet küldjük
+            # (nincs history-újraküldés → konstans latency; friss processz → nincs
+            # stream-multiplexing-üres). Az ELSŐ turn-nél (új/migrált thread) nincs
+            # claude-session → seedeljük a state.db-historyval, és elkapjuk az új session-t.
+            from agent.claude_resume_store import get_claude_session
+            _claude_sid = get_claude_session(self.session_id)
+            if _claude_sid:
+                _stateless_prompt = api_kwargs["prompt"]
+                _resume_sid = _claude_sid
+            else:
+                from agent.claude_process_manager import _render_history
+                _preamble = _render_history(messages)
+                _stateless_prompt = (_preamble + api_kwargs["prompt"]) if _preamble else api_kwargs["prompt"]
+                _resume_sid = None
+            events = asyncio.run(runner.run(
+                prompt=_stateless_prompt,
+                model=api_kwargs["model"],
+                append_system_prompt=append_system_prompt,
+                session_id=_resume_sid,
+                timeout=api_kwargs.get("timeout") or 600,
+                on_delta=_on_delta,
+                on_thinking=_on_thinking,
+                # Per-request thinking-budget (UI Beállítások-kapcsoló) → felülírja az env-et.
+                thinking_tokens=getattr(self, "_thinking_tokens", None),
+            ))
+
+        # ── 5. Normalize response ─────────────────────────────────
+        normalized = transport.normalize_response(events)
+
+        # Store CC session_id for multi-turn resume — per-instance (régi) ÉS perzisztens
+        # (threadhez kötve, túléli a gateway-restartot). A perzisztens a következő turn
+        # --resume-jának alapja.
+        if normalized.provider_data and normalized.provider_data.get("session_id"):
+            self._claude_cli_session_id = normalized.provider_data["session_id"]
+            try:
+                from agent.claude_resume_store import set_claude_session
+                set_claude_session(self.session_id, normalized.provider_data["session_id"])
+            except Exception:
+                pass
+
+        # ── 6. Close / fallback the stream ─────────────────────────
+        # A text-deltákat már a runner streamelte (_on_delta). Itt csak lezárjuk;
+        # ha NEM jött delta (pl. partial-messages kimaradt), fallback: a teljes
+        # content egyben — a régi viselkedés, így nincs regresszió.
+        if self.stream_delta_callback:
+            try:
+                if not _streamed["any"] and normalized.content:
+                    self.stream_delta_callback(normalized.content)
+                self.stream_delta_callback(None)
+            except Exception:
+                pass
+
+        # ── 7. Post-turn hooks ─────────────────────────────────────
+        # Log tool calls for Hermes tracking (CC already executed them).
+        # Also fire the post_tool_call PLUGIN hook per CC tool so harness
+        # plugins (e.g. skill_capture's per-session tool counter) work on the
+        # claude-cli path too — CC executes the tools itself, so without this
+        # the plugin hook never sees them and skill_capture never triggers.
+        if normalized.tool_calls:
+            try:
+                from hermes_cli.plugins import invoke_hook as _invoke_hook
+            except Exception:
+                _invoke_hook = None
+            for tc in normalized.tool_calls:
+                if self.verbose_logging:
+                    logging.debug("CC tool call (already executed): %s", tc.name)
+                if _invoke_hook is not None:
+                    try:
+                        _invoke_hook("post_tool_call", session_id=self.session_id or "",
+                                     tool_name=getattr(tc, "name", ""))
+                    except Exception:
+                        pass
+
+        # Sync turn to external memory provider
+        assistant_content = normalized.content or ""
+        if self._memory_manager:
+            try:
+                # NB: sync_all signature is (user, assistant, *, session_id) — passing a
+                # `messages=` kwarg here raised TypeError that the bare except swallowed,
+                # so memory sync (naplo etc.) SILENTLY never ran on the claude-cli path.
+                self._memory_manager.sync_all(
+                    user_message, assistant_content,
+                    session_id=self.session_id or "",
+                )
+                # Queue prefetch for next turn
+                self._memory_manager.queue_prefetch_all(
+                    user_message, session_id=self.session_id or "",
+                )
+            except Exception:
+                pass
+
+        # Plugin hook: on_session_end. The claude-cli path RETURNS from
+        # run_conversation before reaching the standard on_session_end fire
+        # site, so harness plugins that key off it (skill_capture) never ran
+        # for Apollo chats. Fire it here per completed turn — for the stateless
+        # api_server each completion IS the session boundary; skill_capture
+        # only acts when its per-session tool count crossed the threshold.
+        try:
+            from hermes_cli.plugins import invoke_hook as _invoke_hook2
+            _invoke_hook2(
+                "on_session_end",
+                session_id=self.session_id or "",
+                completed=True,
+                interrupted=False,
+                model=self.model,
+                platform=getattr(self, "platform", None) or "",
+            )
+        except Exception as _hk_exc:
+            logger.debug("naplo/skill on_session_end hook failed: %s", _hk_exc)
+
+        # ── 8. Update messages and persist ─────────────────────────
+        # `messages` arrived as the loaded state.db history (already persisted).
+        # Pass it as conversation_history so _flush_messages_to_session_db only
+        # writes the NEW user+assistant turn. Without this the claude-cli path —
+        # which returns early and never runs the standard loop's incremental
+        # flush — re-inserts the ENTIRE loaded history every turn, so the stored
+        # transcript grows exponentially (14 real msgs → 381 rows). That bloat
+        # then gets reloaded and fed back to Claude, drowning the real context
+        # in dozens of duplicates → "teljesen el van tévedve" on continuation.
+        loaded_history = list(messages)
+        assistant_msg = {"role": "assistant", "content": assistant_content}
+        messages.append({"role": "user", "content": user_message})
+        messages.append(assistant_msg)
+
+        self._persist_session(messages, loaded_history)
+
+        return {
+            "final_response": normalized.content,
+            "messages": messages,
+            "api_calls": 1,
+            "completed": normalized.finish_reason != "error",
+            "error": normalized.provider_data.get("error") if normalized.provider_data else None,
+        }
+
+    def _build_hermes_cc_context(self, working_dir: str | None) -> str:
+        """Build Hermes stable context for CC injection via --append-system-prompt.
+
+        Returns the context string. Also writes to .hermes.md as a side
+        effect (future-proofing for CC versions that may discover it).
+
+        CC has its own tool guidance, environment detection, and task
+        completion instructions, so we only inject Hermes-specific content:
+        identity, skills, memory guidance, and profile hint.
+        """
+        parts = ["# Hermes Agent Context\n"]
+
+        # Agent identity (SOUL.md equivalent)
+        try:
+            soul_path = None
+            if working_dir:
+                _p = Path(working_dir) / "SOUL.md"
+                if _p.exists():
+                    soul_path = _p
+            if not soul_path:
+                hermes_home = get_hermes_home()
+                _p = hermes_home / "SOUL.md"
+                if _p.exists():
+                    soul_path = _p
+            if soul_path:
+                parts.append(f"## Agent Identity\n{soul_path.read_text(encoding='utf-8')}")
+        except Exception:
+            pass
+
+        # Skills index (if curator is active)
+        curator = getattr(self, "_curator", None)
+        if curator:
+            try:
+                skills_prompt = curator.build_skills_system_prompt()
+                if skills_prompt:
+                    parts.append(f"## Active Skills\n{skills_prompt}")
+            except Exception:
+                pass
+
+        # Memory system guidance
+        parts.append(
+            "## Hermes Memory System\n"
+            "This session runs through the Hermes Agent framework. Hermes "
+            "injects persistent memory (facts, user profile) into the system "
+            "context automatically each turn. This memory is trust-scored and "
+            "curated — treat it as authoritative reference data.\n\n"
+            "When you learn something new about the user or their projects "
+            "that should persist across sessions, mention it — Hermes will "
+            "capture it in the memory store."
+        )
+
+        # Active Hermes profile hint
+        try:
+            from agent.file_safety import _resolve_active_profile_name
+            active_profile = _resolve_active_profile_name()
+        except Exception:
+            active_profile = "default"
+        parts.append(f"## Hermes Profile\nActive profile: {active_profile}")
+
+        content = "\n\n".join(parts)
+
+        # Write to .hermes.md as side effect (future-proofing)
+        if working_dir:
+            try:
+                hermes_md = Path(working_dir) / ".hermes.md"
+                if not hermes_md.exists() or hermes_md.read_text(encoding="utf-8") != content:
+                    hermes_md.write_text(content, encoding="utf-8")
+            except Exception:
+                pass
+
+        return content
+
 def main(
     query: str = None,
     model: str = "",
