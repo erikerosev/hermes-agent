@@ -349,7 +349,19 @@ def _is_backend_available(backend: str) -> bool:
             return has_xai_credentials()
         except Exception:
             return False
-    return False
+    # Anything else is a plugin provider this list predates — ask the
+    # registry rather than declaring it unavailable, which would silently
+    # fall back to web.backend and ignore the user's explicit choice.
+    from agent.web_search_registry import get_provider
+
+    provider = get_provider(backend)
+    if provider is None:
+        return False
+    try:
+        return provider.is_available()
+    except Exception:  # noqa: BLE001 — a broken plugin must not break selection
+        logger.warning("Availability probe failed for backend %r", backend, exc_info=True)
+        return False
 
 
 def _ddgs_package_importable() -> bool:

@@ -2483,16 +2483,43 @@ def terminal_tool(
                         session_key=session_key,
                     )
 
-                result_data = {
-                    "output": "Background process started",
-                    "session_id": proc_session.id,
-                    "pid": proc_session.pid,
-                    "exit_code": 0,
-                    "error": None,
-                }
-                # Background spawns detached and returns exit_code 0 immediately;
-                # it never inline-polls is_interrupted(), so the stale-bit kill
-                # cannot occur here and this note never co-occurs with rc=130.
+                # Don't claim success blindly: a backgrounded command that instantly
+                # dies (typo, missing binary, import error) was previously reported as
+                # exit_code:0 / error:None, so the model believed a dead server was up.
+                # Give the local reader a beat to catch instant death, then report the
+                # REAL state.
+                if env_type == "local":
+                    time.sleep(0.25)
+                if getattr(proc_session, "exited", False) is True:
+                    _ec = proc_session.exit_code
+                    result_data = {
+                        "output": (proc_session.output_buffer or "").strip()
+                                  or "Background command exited immediately.",
+                        "session_id": proc_session.id,
+                        "pid": proc_session.pid,
+                        "status": "exited",
+                        "exit_code": _ec,
+                        "error": (
+                            f"Background command exited immediately with code {_ec} — it "
+                            f"did NOT keep running. Check the command before relying on it."
+                        ) if _ec not in (0, None) else None,
+                    }
+                else:
+                    result_data = {
+                        "output": "Background process started.",
+                        "session_id": proc_session.id,
+                        "pid": proc_session.pid,
+                        "status": "started",
+                        # NOT exit_code:0 — the command is still running; success is
+                        # unknown. Poll the session for its real outcome.
+                        "exit_code": None,
+                        "error": None,
+                    }
+                    if not proc_session.pid:
+                        result_data["warning"] = (
+                            "Could not confirm the process started (no PID captured) — "
+                            "verify via the session before relying on it."
+                        )
                 if approval_note:
                     result_data["approval"] = approval_note
                 if pty_disabled_reason:
