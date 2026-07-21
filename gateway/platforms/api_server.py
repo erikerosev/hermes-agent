@@ -1752,6 +1752,10 @@ class APIServerAdapter(BasePlatformAdapter):
         tool_progress_callback=None,
         tool_start_callback=None,
         tool_complete_callback=None,
+        clarify_callback=None,
+        status_callback=None,
+        thinking_callback=None,
+        thinking_tokens=None,
         gateway_session_key: Optional[str] = None,
         route: Optional[Dict[str, Any]] = None,
     ) -> Any:
@@ -1869,11 +1873,20 @@ class APIServerAdapter(BasePlatformAdapter):
             tool_progress_callback=tool_progress_callback,
             tool_start_callback=tool_start_callback,
             tool_complete_callback=tool_complete_callback,
+            status_callback=status_callback,
+            thinking_callback=thinking_callback,
             session_db=self._ensure_session_db(),
             fallback_model=fallback_model,
             reasoning_config=reasoning_config,
             gateway_session_key=gateway_session_key,
         )
+        # Wire the clarify tool's user-interaction callback (set as an attribute,
+        # mirroring gateway/run.py). When unset, the clarify tool reports it is
+        # unavailable in this execution context.
+        if clarify_callback is not None:
+            agent.clarify_callback = clarify_callback
+        # Per-request thinking-budget (UI kapcsoló) → a claude-cli spawn MAX_THINKING_TOKENS-e.
+        agent._thinking_tokens = thinking_tokens
         return agent
 
     # ------------------------------------------------------------------
@@ -1885,6 +1898,29 @@ class APIServerAdapter(BasePlatformAdapter):
         return web.json_response(
             {"status": "ok", "platform": "hermes-agent", "version": _hermes_version()}
         )
+
+    async def _handle_clarify(self, request: "web.Request") -> "web.Response":
+        """POST /v1/clarify — answer a pending ``clarify`` prompt.
+
+        Body: ``{"clarify_id": "<id from the hermes.clarify SSE event>",
+        "response": "<the user's answer>"}``. Unblocks the agent worker thread
+        that is waiting inside the ``clarify`` tool so it can continue on the
+        same (still-open) chat-completions SSE stream.
+        """
+        try:
+            body = await request.json()
+        except Exception:
+            return web.json_response({"error": "invalid JSON body"}, status=400)
+        clarify_id = str(body.get("clarify_id") or "").strip()
+        if not clarify_id:
+            return web.json_response({"error": "clarify_id is required"}, status=400)
+        response_text = body.get("response", "")
+        from tools.clarify_gateway import resolve_gateway_clarify
+        resolved = resolve_gateway_clarify(clarify_id, str(response_text))
+        if not resolved:
+            # Unknown id, already answered, or expired (timed out / session end).
+            return web.json_response({"resolved": False}, status=404)
+        return web.json_response({"resolved": True})
 
     async def _handle_health_detailed(self, request: "web.Request") -> "web.Response":
         """GET /health/detailed — rich status for cross-container dashboard probing.
@@ -2781,6 +2817,10 @@ class APIServerAdapter(BasePlatformAdapter):
         # configured model_routes alias, this request's agent is created
         # with that route's model/provider instead of the global default.
         route = self._resolve_route(model_name)
+        # Aux-sentinel: ha a kért modell aux (pl. apollo-aux), a side-taskeket a
+        # könnyű úton futtatjuk (persona/MCP/memória nélkül, olcsó modellel, szemafor
+        # mögött). A normál user-turn (hermes-agent) változatlan marad.
+        _is_aux, _aux_model = self._resolve_aux_model(model_name)
 
         if stream:
             import queue as _q
@@ -2839,11 +2879,61 @@ class APIServerAdapter(BasePlatformAdapter):
                 if not tool_call_id or tool_call_id not in _started_tool_call_ids:
                     return
                 _started_tool_call_ids.discard(tool_call_id)
+                # Derive success/failure + a short result preview so SSE clients
+                # can render the REAL outcome (✓ / ✗ + error text) instead of an
+                # unconditional "done". Closes the gap where a failed tool (e.g.
+                # `command not found`, exit!=0) would still show as success and
+                # let the model quietly narrate a fabricated result.
+                # Uses the SAME predicate the agent itself uses (run_agent calls
+                # _detect_tool_failure with this exact function_result), so the
+                # ok flag matches the agent's own is_error.
+                from agent.display import _detect_tool_failure
+                try:
+                    _is_err, _ = _detect_tool_failure(function_name, function_result)
+                except Exception:
+                    _is_err = False
+                try:
+                    _txt = function_result if isinstance(function_result, str) else str(function_result)
+                except Exception:
+                    _txt = ""
+                _preview = " ".join(_txt.split())
+                if len(_preview) > 200:
+                    _preview = _preview[:197] + "…"
                 _stream_q.put(("__tool_progress__", {
                     "tool": function_name,
                     "toolCallId": tool_call_id,
                     "status": "completed",
+                    "ok": (not _is_err),
+                    "result": _preview,
                 }))
+
+            # Clarify support: when the agent calls the ``clarify`` tool, surface
+            # the question over SSE as an ``event: hermes.clarify`` frame and
+            # block the agent's worker thread until the client answers via
+            # ``POST /v1/clarify`` (which calls ``resolve_gateway_clarify``).
+            # Mirrors the messaging-platform wiring in gateway/run.py, but the
+            # delivery channel is the SSE queue instead of an adapter's
+            # ``send_clarify``. Runs on the agent worker thread (sync contract).
+            def _clarify_cb(question: str, choices) -> str:
+                from tools import clarify_gateway as _clarify_mod
+                import uuid as _uuid
+                clarify_id = _uuid.uuid4().hex[:10]
+                _clarify_mod.register(
+                    clarify_id=clarify_id,
+                    session_key=session_id or completion_id,
+                    question=question,
+                    choices=list(choices) if choices else None,
+                )
+                _stream_q.put(("__clarify__", {
+                    "clarify_id": clarify_id,
+                    "question": question,
+                    "choices": list(choices) if choices else None,
+                }))
+                timeout = _clarify_mod.get_clarify_timeout()
+                response = _clarify_mod.wait_for_response(clarify_id, timeout=float(timeout))
+                if response is None or response == "":
+                    return f"[user did not respond within {int(timeout / 60)}m]"
+                return response
 
             # Start agent in background.  agent_ref is a mutable container
             # so the SSE writer can interrupt the agent on client disconnect.
@@ -2851,8 +2941,25 @@ class APIServerAdapter(BasePlatformAdapter):
             # ``tool_progress_callback`` is intentionally not wired here:
             # it would duplicate every emit because ``run_agent`` fires it
             # side-by-side with ``tool_start_callback``/``tool_complete_callback``.
-            # The structured callbacks are strictly richer (they carry
-            # the tool_call id), so they own the chat-completions SSE channel.
+            # The structured callbacks are strictly richer (they carry the
+            # tool_call id), so they own the chat-completions SSE channel.
+            # Fázis-jelzés a frontendnek (pl. claude-cli: cold-spawn alatt "Indul…",
+            # majd "Gondolkodik…" az első tokenig). VALÓDI állapot — a runtime hívja,
+            # nem időzítő. UI-only frame → a szigorú OpenAI/voice kliens elnyomja.
+            def _on_status(phase, label=None):
+                if not phase:
+                    return
+                _stream_q.put(("__status__", {"phase": phase, "label": label}))
+
+            # Élő gondolatmenet (extended thinking) → UI-only frame, a szigorú
+            # OpenAI/voice kliens elnyomja (mint a tool-progress/status).
+            def _on_thinking(text):
+                if text:
+                    _stream_q.put(("__thinking__", {"text": text}))
+
+            # Per-request thinking-budget a UI Beállítások-kapcsolóból (fenris a
+            # X-Hermes-Thinking-Tokens headerben küldi). Felülírja az env-defaultot.
+            _thinking_hdr = request.headers.get("X-Hermes-Thinking-Tokens", "").strip() or None
             agent_ref = [None]
             agent_task = asyncio.ensure_future(self._run_agent(
                 user_message=user_message,
@@ -2862,9 +2969,16 @@ class APIServerAdapter(BasePlatformAdapter):
                 stream_delta_callback=_on_delta,
                 tool_start_callback=_on_tool_start,
                 tool_complete_callback=_on_tool_complete,
+                clarify_callback=_clarify_cb,
+                status_callback=_on_status,
+                thinking_callback=_on_thinking,
+                thinking_tokens=_thinking_hdr,
                 agent_ref=agent_ref,
                 gateway_session_key=gateway_session_key,
                 route=route,
+                aux_lightweight=_is_aux,
+                aux_model=_aux_model,
+                pinned_session=bool(provided_session_id),
             ))
             # Ensure SSE drain loops can terminate without relying on polling
             # agent_task.done(), which can race with queue timeout checks.
@@ -2885,6 +2999,9 @@ class APIServerAdapter(BasePlatformAdapter):
                 session_id=session_id,
                 gateway_session_key=gateway_session_key,
                 route=route,
+                aux_lightweight=_is_aux,
+                aux_model=_aux_model,
+                pinned_session=bool(provided_session_id),
             )
 
         idempotency_key = request.headers.get("Idempotency-Key")
@@ -3019,6 +3136,16 @@ class APIServerAdapter(BasePlatformAdapter):
         response = web.StreamResponse(status=200, headers=sse_headers)
         await response.prepare(request)
 
+        # Strict OpenAI clients (e.g. the LiveKit voice plugin) parse EVERY
+        # `data:` frame as a chat.completion.chunk and crash on our custom
+        # `event: hermes.tool.progress` frames (no `choices` field → choices=None
+        # → "NoneType is not iterable"). Such clients send `X-Hermes-Tool-Progress: off`
+        # to suppress the UI-only progress frames; the tool still runs server-side
+        # and the full answer still streams. Default keeps progress (chat frontend).
+        _suppress_tool_progress = request.headers.get(
+            "X-Hermes-Tool-Progress", ""
+        ).strip().lower() in ("off", "false", "0", "none", "no")
+
         try:
             last_activity = time.monotonic()
 
@@ -3042,10 +3169,32 @@ class APIServerAdapter(BasePlatformAdapter):
                 conversation history.  See #6972 for the original event,
                 #16588 for the ``toolCallId``/``status`` lifecycle fields.
                 """
-                if isinstance(item, tuple) and len(item) == 2 and item[0] == "__tool_progress__":
+                if isinstance(item, tuple) and len(item) == 2 and item[0] == "__clarify__":
+                    # Clarify prompt — the agent is now blocked waiting for the
+                    # user's answer (POST /v1/clarify). Essential, not UI-only,
+                    # so it is NOT subject to X-Hermes-Tool-Progress suppression.
+                    await response.write(
+                        f"event: hermes.clarify\ndata: {json.dumps(item[1])}\n\n".encode()
+                    )
+                elif isinstance(item, tuple) and len(item) == 2 and item[0] == "__tool_progress__":
+                    if _suppress_tool_progress:
+                        # Strict OpenAI client (voice): skip the UI-only frame.
+                        return time.monotonic()
                     event_data = json.dumps(item[1])
                     await response.write(
                         f"event: hermes.tool.progress\ndata: {event_data}\n\n".encode()
+                    )
+                elif isinstance(item, tuple) and len(item) == 2 and item[0] == "__status__":
+                    if _suppress_tool_progress:
+                        return time.monotonic()  # UI-only fázis-jelzés — voice kliens elnyomja
+                    await response.write(
+                        f"event: hermes.status\ndata: {json.dumps(item[1])}\n\n".encode()
+                    )
+                elif isinstance(item, tuple) and len(item) == 2 and item[0] == "__thinking__":
+                    if _suppress_tool_progress:
+                        return time.monotonic()  # UI-only gondolatmenet — voice kliens elnyomja
+                    await response.write(
+                        f"event: hermes.thinking\ndata: {json.dumps(item[1])}\n\n".encode()
                     )
                 else:
                     content_chunk = {
@@ -4629,9 +4778,16 @@ class APIServerAdapter(BasePlatformAdapter):
         tool_progress_callback=None,
         tool_start_callback=None,
         tool_complete_callback=None,
+        clarify_callback=None,
+        status_callback=None,
+        thinking_callback=None,
+        thinking_tokens=None,
         agent_ref: Optional[list] = None,
         gateway_session_key: Optional[str] = None,
         route: Optional[Dict[str, Any]] = None,
+        aux_lightweight: bool = False,
+        aux_model: Optional[str] = None,
+        pinned_session: bool = False,
     ) -> tuple:
         """
         Create an agent and run a conversation in a thread executor.
@@ -4703,6 +4859,45 @@ class APIServerAdapter(BasePlatformAdapter):
             return await loop.run_in_executor(None, _run)
         finally:
             self._inflight_agent_runs -= 1
+
+    def _get_aux_semaphore(self) -> "asyncio.Semaphore":
+        """Lazy, event-loop-kötött szemafor az aux-turnökhöz (HERMES_AUX_MAX_CONCURRENCY, def. 2)."""
+        sem = getattr(self, "_aux_semaphore", None)
+        if sem is None:
+            try:
+                limit = max(1, int(os.environ.get("HERMES_AUX_MAX_CONCURRENCY", "2")))
+            except (TypeError, ValueError):
+                limit = 2
+            sem = asyncio.Semaphore(limit)
+            self._aux_semaphore = sem
+        return sem
+
+    @staticmethod
+    def _resolve_aux_model(model_name) -> tuple:
+        """Aux-sentinel felismerés → (is_aux, aux_model).
+
+        ``apollo-aux``            → könnyű út, default modell (HERMES_AUX_CLAUDE_MODEL, def. haiku)
+        ``apollo-aux:<model>``    → könnyű út a megadott modellel (pl. ``apollo-aux:sonnet``
+                                    a garden-kutatáshoz: persona/MCP nélkül, de sonnet-minőség)
+        Extra aliasok: HERMES_AUX_LIGHT_MODELS (vesszős). A normál user-turn
+        (``hermes-agent``) SOSEM aux. Minden más → (False, None).
+        """
+        if not isinstance(model_name, str):
+            return False, None
+        name = model_name.strip().lower()
+        if not name:
+            return False, None
+        prefix, _, suffix = name.partition(":")
+        aliases = {"apollo-aux"}
+        for n in os.environ.get("HERMES_AUX_LIGHT_MODELS", "").split(","):
+            n = n.strip().lower()
+            if n:
+                aliases.add(n)
+        if prefix not in aliases:
+            return False, None
+        default_aux = os.environ.get("HERMES_AUX_CLAUDE_MODEL", "haiku")
+        chosen = suffix.strip() if suffix.strip() else default_aux
+        return True, chosen
 
     # ------------------------------------------------------------------
     # /v1/runs — structured event streaming
