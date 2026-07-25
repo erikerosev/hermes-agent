@@ -810,7 +810,72 @@ def _atomic_write_text(file_path: Path, content: str, encoding: str = "utf-8") -
 # Core actions
 # =============================================================================
 
-def _create_skill(name: str, content: str, category: str = None) -> Dict[str, Any]:
+_OVERLAP_STOPWORDS = {
+    # HU
+    "hogy", "vagy", "egy", "_az_", "ami", "amikor", "kell", "van", "nem", "ezt",
+    "skill", "betoltendo", "hasznald", "hasznalat", "alapjan", "eszkoz", "tool",
+    # EN
+    "the", "and", "for", "use", "used", "when", "with", "this", "that", "are",
+    "from", "into", "your", "you", "via", "using", "user", "data", "file", "files",
+}
+
+
+def _overlap_tokens(text: str) -> set:
+    """Accent-stripped, lowercased significant tokens (len>=4). Az ékezet-strip
+    miatt az 'időjárás' és 'idojaras' egy tokenre esik, és a közös tulajdonnevek
+    (máriapócs, accuweather) / toolnevek is egyeznek HU/EN leírás között is."""
+    import unicodedata
+    folded = "".join(c for c in unicodedata.normalize("NFKD", text.lower())
+                     if not unicodedata.combining(c))
+    toks = re.findall(r"[a-z0-9_]{4,}", folded)
+    return {t for t in toks if t not in _OVERLAP_STOPWORDS}
+
+
+def _overlapping_skills(name: str, content: str, threshold: float = 0.30) -> List[Dict[str, Any]]:
+    """Meglévő skillek, amelyek a NÉV+DESCRIPTION alapján erősen átfednek az újjal.
+    A duplikátum-gyártás (weather-check vs idojaras-ellenorzes) gyökér-oka az volt,
+    hogy a create CSAK pontos név-ütközést nézett. Determinisztikus, nincs LLM-költség.
+    Korlát: tisztán eltérő nyelvű, közös tulajdonnév nélküli párokat (HU vs EN próza)
+    nem mindig fog el — ott a leírásban lévő kereszthivatkozás a jelzés."""
+    try:
+        _fm = re.search(r'\n---\s*\n', content[3:])
+        parsed = yaml.safe_load(content[3:_fm.start() + 3]) if _fm else {}
+        new_desc = str(parsed.get("description", ""))
+    except Exception:
+        new_desc = ""
+    new_tokens = _overlap_tokens(name + " " + new_desc)
+    if len(new_tokens) < 3:
+        return []
+    hits = []
+    base = _skills_dir()
+    for skill_md in base.rglob("SKILL.md"):
+        # a saját eltávolított/archivált mappákat hagyd ki
+        if any(p.startswith(("_removed", ".archive")) for p in skill_md.parts):
+            continue
+        try:
+            raw = skill_md.read_text(encoding="utf-8")
+            _fm2 = re.search(r'\n---\s*\n', raw[3:])
+            meta = yaml.safe_load(raw[3:_fm2.start() + 3]) if _fm2 else {}
+            ex_name = str(meta.get("name", "")) or skill_md.parent.name
+            if ex_name == name:
+                continue
+            ex_tokens = _overlap_tokens(ex_name + " " + str(meta.get("description", "")))
+        except Exception:
+            continue
+        if not ex_tokens:
+            continue
+        shared = new_tokens & ex_tokens
+        score = len(shared) / min(len(new_tokens), len(ex_tokens))
+        if score >= threshold:
+            hits.append({"name": ex_name, "score": round(score, 2),
+                         "description": str(meta.get("description", ""))[:140],
+                         "shared": sorted(shared)[:8]})
+    hits.sort(key=lambda h: h["score"], reverse=True)
+    return hits[:4]
+
+
+def _create_skill(name: str, content: str, category: str = None,
+                  allow_overlap: bool = False) -> Dict[str, Any]:
     """Create a new user skill with SKILL.md content."""
     # Validate name
     err = _validate_name(name)
@@ -837,6 +902,26 @@ def _create_skill(name: str, content: str, category: str = None) -> Dict[str, An
             "success": False,
             "error": f"A skill named '{name}' already exists at {existing['path']}."
         }
+
+    # Overlap gate: a puszta név-egyediség NEM elég — capability-átfedés is duplikátum.
+    # Ez a fő fix a 3 átfedő pár (növény/időjárás/excel) újratermelődése ellen.
+    # Jóváhagyott staged-write replay-nél (_skill_gate_bypass) NEM tüzel — a user már OK-zta.
+    if not allow_overlap and not _skill_gate_bypass.get():
+        overlaps = _overlapping_skills(name, content)
+        if overlaps:
+            listing = "; ".join(f"'{o['name']}' (átfedés {o['score']}, "
+                                f"közös: {', '.join(o['shared'])})" for o in overlaps)
+            return {
+                "success": False,
+                "error": (
+                    f"Ez a skill valószínűleg ÁTFED meglévő skill(ek)et: {listing}. "
+                    "Egy képesség = egy skill. ELŐSZÖR nézd meg a fentit (skill_view), és ha a "
+                    "képesség ugyanaz, azt BŐVÍTSD (action='edit' vagy 'patch') új skill helyett. "
+                    "Ha tényleg különálló, hívd újra a create-et allow_overlap=true-val, és a "
+                    "description-ben mondd ki, miben más."
+                ),
+                "overlaps": overlaps,
+            }
 
     # Create the skill directory
     skill_dir = _resolve_skill_dir(name, category)
@@ -1348,6 +1433,7 @@ def skill_manage(
     new_string: str = None,
     replace_all: bool = False,
     absorbed_into: str = None,
+    allow_overlap: bool = False,
 ) -> str:
     """
     Manage user-created skills. Dispatches to the appropriate action handler.
@@ -1374,7 +1460,7 @@ def skill_manage(
     if action == "create":
         if not content:
             return tool_error("content is required for 'create'. Provide the full SKILL.md text (frontmatter + body).", success=False)
-        result = _create_skill(name, content, category)
+        result = _create_skill(name, content, category, allow_overlap=allow_overlap)
 
     elif action == "edit":
         if not content:
@@ -1549,6 +1635,16 @@ SKILL_MANAGE_SCHEMA = {
                     "on delete is supported for backward compatibility but "
                     "downstream tooling (e.g. cron-job skill reference "
                     "rewriting) will have to guess at intent."
+                )
+            },
+            "allow_overlap": {
+                "type": "boolean",
+                "description": (
+                    "For 'create' only. Default false. A create is soft-blocked if it "
+                    "strongly overlaps an existing skill (one capability = one skill). "
+                    "When blocked, FIRST inspect the named skill and prefer edit/patch. "
+                    "Set true ONLY if the new skill is genuinely distinct and you have "
+                    "made the difference explicit in its description."
                 )
             },
         },

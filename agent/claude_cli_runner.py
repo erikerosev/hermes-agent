@@ -513,6 +513,20 @@ class ClaudeCliRunner:
                 "args": [kozos_script],
                 "env": kozos_env,
             }
+        # Atlassian (Jira/Confluence/JSM/Bitbucket/Compass) remote MCP — OPT-IN.
+        # HERMES_ATLASSIAN_MCP: teljes URL, vagy "1"/"on" a hivatalos endpointhoz. Az
+        # OAuth-ot maga a claude bináris intézi (nincs client-id/secret a configban); a
+        # token a KÖZÖS ~/.claude store-ba cache-elődik, így egy egyszeri böngészős
+        # engedélyezés után a headless (-p) futás is újrahasználja. A --strict-mcp-config
+        # a szerver-DEKLARÁCIÓT szűri, a credential-lookupot NEM, ezért működik.
+        # NINCS profil-kapu: a fenris erik/tundi megkülönböztetés fenris-SZINTŰ (profile_id
+        # a WS-en), NEM ér el ide HERMES_PROFILE-ként (a gateway Hermes-profilja "default").
+        # Egy távoli http-MCP olcsó (nincs lokális processz-spawn), ezért mindkét profilnak
+        # elérhető; ha valaha kell a szűkítés, a fenris profile_id-t kell a runnerig vezetni.
+        atl = (os.environ.get("HERMES_ATLASSIAN_MCP") or "").strip()
+        if atl:
+            url = atl if atl.lower().startswith("http") else "https://mcp.atlassian.com/v1/mcp/authv2"
+            mcp_servers["atlassian"] = {"type": "http", "url": url}
         config = {"mcpServers": mcp_servers}
         try:
             tmpf = tempfile.NamedTemporaryFile(
