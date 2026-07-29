@@ -168,6 +168,10 @@ class _PersistentProc:
         # generáló session régi last_used-dal LRU-áldozat lehetne → "megszakítja a másik
         # threadet". Az eviction/reap ezért a busy processzt SOSEM lövi ki.
         self.busy = False
+        # KOSZOS-e: ha egy read_turn NEM tiszta `result`-tal zárt (timeout/abandon), a
+        # claude tovább generál a KÖZÖS queue-ba → a következő turn azt olvasná (desync/replay).
+        # Ilyenkor a processzt újra kell indítani, mielőtt új turn menne rá.
+        self.dirty = False
         # Friss processz: még nincs benne a beszélgetés-history. Az ELSŐ turn-jén
         # feltöltjük a state.db-ből kapott előzménnyel (különben restart/respawn után
         # a kontextus elveszne, mert a live processz csak a memóriájában tartotta).
@@ -202,6 +206,9 @@ class _PersistentProc:
         és — ha adottak — on_tool_use/on_tool_result-t hív (élő tool-státusz)."""
         events: list[StreamEvent] = []
         deadline = time.time() + timeout
+        # Amíg tiszta `result`-tal nem zárunk, a processz KOSZOS marad (a hívó félbeszakíthat,
+        # timeout lehet) → a következő acquire recycle-öli, hogy ne olvasson leszakadt maradékot.
+        self.dirty = True
         while time.time() < deadline:
             try:
                 raw = self._q.get(timeout=min(5.0, max(0.1, deadline - time.time())))
@@ -229,7 +236,9 @@ class _PersistentProc:
                     except Exception:
                         pass
                 if ev.is_complete:
+                    self.dirty = False   # tiszta lezárás — a processz újrahasználható
                     return events
+        # Ide csak timeout/EOF esetén jutunk → dirty MARAD True (a claude tovább generálhat).
         if not events:
             events.append(StreamEvent(
                 raw={}, message_type=MessageType.RESULT, is_complete=True,
@@ -309,11 +318,15 @@ class ClaudeProcessManager:
             # Recycle, ha: (a) elérte a turn-küszöböt (kontextus-bound), VAGY (b) a
             # thinking-kapcsoló (UI) megváltozott a spawn óta — a budget a spawnkor dől el.
             _toggle_changed = proc is not None and proc.thinking_tokens != thinking_tokens
+            # KOSZOS processz (előző turn nem tiszta result-tal zárt → leszakadt maradék a
+            # queue-ban) VAGY nem-üres queue → ÚJRA kell indítani, különben a következő turn a
+            # leszakadt kimenetet olvasná (desync/replay). Ez a persistent egy-turn-eltolódás fixe.
+            _dirty = proc is not None and (proc.dirty or not proc._q.empty())
             recycle = proc is not None and proc.is_running() and (
-                proc.turn_count >= _RECYCLE_TURNS or _toggle_changed)
+                proc.turn_count >= _RECYCLE_TURNS or _toggle_changed or _dirty)
             if recycle:
-                logger.info("persistent claude recycle (session=%s, turns=%s, toggle_changed=%s)",
-                            key, proc.turn_count, _toggle_changed)
+                logger.info("persistent claude recycle (session=%s, turns=%s, toggle_changed=%s, dirty=%s)",
+                            key, proc.turn_count, _toggle_changed, _dirty)
             if proc is None or not proc.is_running() or recycle:
                 if proc is not None:
                     proc.kill()
