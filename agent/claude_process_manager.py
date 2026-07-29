@@ -164,6 +164,10 @@ class _PersistentProc:
         self.lock = threading.Lock()   # egy turn egyszerre per processz
         self.last_used = time.time()
         self.turn_count = 0  # hány turn futott ezen a processzen (recycle-küszöbhöz)
+        # ÉPP DOLGOZIK-e (mid-turn): a last_used csak a turn VÉGÉN frissül, ezért egy
+        # generáló session régi last_used-dal LRU-áldozat lehetne → "megszakítja a másik
+        # threadet". Az eviction/reap ezért a busy processzt SOSEM lövi ki.
+        self.busy = False
         # Friss processz: még nincs benne a beszélgetés-history. Az ELSŐ turn-jén
         # feltöltjük a state.db-ből kapott előzménnyel (különben restart/respawn után
         # a kontextus elveszne, mert a live processz csak a memóriájában tartotta).
@@ -337,27 +341,34 @@ class ClaudeProcessManager:
                         return preamble + prompt
                 return prompt
 
+            proc.busy = True  # mid-turn → az eviction/reap nem lövi ki (más thread védve)
             try:
-                proc.send(_payload(proc))
-            except Exception as exc:
-                logger.warning("persistent claude send failed (%s) — respawning", exc)
-                proc.kill()
-                with self._lock:
-                    proc = self._spawn(model, append_system_prompt, working_dir, thinking_tokens)
-                    self._procs[key] = proc
-                proc.send(_payload(proc))
-            # A prompt elment, a model dolgozik — "Gondolkodik…" az első tokenig.
-            _status("thinking")
-            events = proc.read_turn(on_delta, timeout, on_thinking=on_thinking,
-                                    on_tool_use=on_tool_use, on_tool_result=on_tool_result)
-            proc.last_used = time.time()
-            proc.turn_count += 1  # recycle-küszöbhöz
-            return events
+                try:
+                    proc.send(_payload(proc))
+                except Exception as exc:
+                    logger.warning("persistent claude send failed (%s) — respawning", exc)
+                    proc.kill()
+                    with self._lock:
+                        proc = self._spawn(model, append_system_prompt, working_dir, thinking_tokens)
+                        self._procs[key] = proc
+                    proc.busy = True
+                    proc.send(_payload(proc))
+                # A prompt elment, a model dolgozik — "Gondolkodik…" az első tokenig.
+                _status("thinking")
+                events = proc.read_turn(on_delta, timeout, on_thinking=on_thinking,
+                                        on_tool_use=on_tool_use, on_tool_result=on_tool_result)
+                proc.last_used = time.time()
+                proc.turn_count += 1  # recycle-küszöbhöz
+                return events
+            finally:
+                proc.busy = False
 
     def _reap_idle_locked(self) -> None:
         now = time.time()
+        # busy (mid-turn) processzt sosem reap-elünk: a last_used stale, de él és dolgozik
+        # (pl. hosszú tool-lánc > TTL alatt) — kilövése megszakítaná az aktív turn-t.
         dead = [k for k, p in self._procs.items()
-                if not p.is_running() or (now - p.last_used) > _IDLE_TTL]
+                if not p.busy and (not p.is_running() or (now - p.last_used) > _IDLE_TTL)]
         for k in dead:
             self._procs[k].kill()
             del self._procs[k]
@@ -370,9 +381,10 @@ class ClaudeProcessManager:
         bennmaradna a poolban a TTL lejártáig, és 2 MCP-szervert tartana fenn."""
         if len(self._procs) <= _MAX_PROCS:
             return
-        # legrégebben használt elöl
+        # legrégebben használt elöl; a `protect` (induló turn) ÉS minden `busy` (más
+        # threaden épp generáló) processz védett → sosem szakítunk meg aktív turn-t.
         victims = sorted(
-            (k for k in self._procs if k != protect),
+            (k for k in self._procs if k != protect and not self._procs[k].busy),
             key=lambda k: self._procs[k].last_used,
         )
         while len(self._procs) > _MAX_PROCS and victims:
