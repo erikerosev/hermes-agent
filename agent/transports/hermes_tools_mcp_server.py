@@ -127,6 +127,11 @@ EXPOSED_TOOLS: tuple[str, ...] = (
     "skill_view",
     "skills_list",
     "text_to_speech",
+    # Scheduling: cronjob is stateless-dispatchable (NOT in _AGENT_LOOP_TOOLS),
+    # so the moat can drive it. Exposed so the assistant can actually schedule
+    # recurring/proactive work (monthly admin, check-ins) — the how-to lives in
+    # the `cron-job-management` skill.
+    "cronjob",
     # Kanban worker handoff tools — gated on HERMES_KANBAN_TASK env var
     # (set by the kanban dispatcher when spawning a worker). Without these
     # in the callback, a worker spawned with openai_runtime=codex_app_server
