@@ -211,7 +211,8 @@ class ClaudeCliRunner:
             try:
                 with open(f"/proc/{_cpid}/cmdline", "rb") as _f:
                     _cl = _f.read().decode("utf-8", "replace")
-                if "hermes_tools_mcp_server" in _cl or "kozos_mcp_server" in _cl:
+                if ("hermes_tools_mcp_server" in _cl or "kozos_mcp_server" in _cl
+                        or "behavior_rules_mcp_server" in _cl):
                     _os.kill(_cpid, _signal.SIGKILL)
             except Exception:
                 pass
@@ -512,6 +513,23 @@ class ClaudeCliRunner:
                 "command": sys.executable,
                 "args": [kozos_script],
                 "env": kozos_env,
+            }
+        # Behavior-rules híd: Apollo önmódosuló viselkedési szabály-tára (add/list/
+        # disable/update). Opt-in: HERMES_BEHAVIOR_MCP a behavior_rules_mcp_server.py
+        # útja. A szerver a ~/.hermes/behavior-rules.json-t írja (HOST-fájl); a fenris
+        # backend RO olvassa és user-turn direktívaként injektálja. Mindkét profil (a
+        # kozos-hoz hasonlóan) — a szabály maga hordozza a profil-célzást.
+        behavior_script = os.environ.get("HERMES_BEHAVIOR_MCP")
+        if behavior_script and Path(behavior_script).is_file():
+            # A store-utat MINDIG abszolútként adjuk át — a claude az MCP-alfolyamatnak a
+            # megadott env-et adja (HOME nélkül a szerver Path.home()-ja elszállna).
+            behavior_path = os.environ.get("HERMES_BEHAVIOR_RULES_PATH") or str(
+                Path.home() / ".hermes" / "behavior-rules.json"
+            )
+            mcp_servers["behavior-rules"] = {
+                "command": sys.executable,
+                "args": [behavior_script],
+                "env": {"HERMES_BEHAVIOR_RULES_PATH": behavior_path},
             }
         # Atlassian (Jira/Confluence/JSM/Bitbucket/Compass) remote MCP — OPT-IN.
         # HERMES_ATLASSIAN_MCP: teljes URL, vagy "1"/"on" a hivatalos endpointhoz. Az
