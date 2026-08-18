@@ -134,6 +134,7 @@ class ClaudeCliTransport(ProviderTransport):
         text_parts: list[str] = []
         thinking_parts: list[str] = []
         tool_calls: list[ToolCall] = []
+        seen_tool_ids: set[str] = set()
         usage: Optional[Usage] = None
         session_id: Optional[str] = None
         has_error = False
@@ -155,6 +156,29 @@ class ClaudeCliTransport(ProviderTransport):
                 error_text = event.error
                 continue
 
+            # Collect tool use events — DELIBERATELY BEFORE the is_partial guard.
+            # `--include-partial-messages` (the live thinking-stream) makes the CLI
+            # emit every assistant message with stop_reason=None, so the parser marks
+            # ALL of them is_partial=True (verified live: thinking/tool_use/text blocks
+            # alike). Collecting below the guard therefore dropped 100% of tool_use
+            # blocks, silently zeroing `tool_calls` on this path — which is what killed
+            # skill_capture's per-session tool counter (always tools=0 → the
+            # self-improvement capture never fired). Dedupe on tool_id, because a
+            # tool_use block may repeat across successive partial snapshots.
+            tool_use = getattr(event, "tool_use", None)
+            if tool_use is not None:
+                _tid = getattr(tool_use, "tool_id", None) or ""
+                _key = _tid or f"{getattr(tool_use, 'tool_name', 'unknown')}#{len(tool_calls)}"
+                if _key not in seen_tool_ids:
+                    seen_tool_ids.add(_key)
+                    tool_calls.append(
+                        build_tool_call(
+                            id=getattr(tool_use, "tool_id", None),
+                            name=getattr(tool_use, "tool_name", "unknown"),
+                            arguments=getattr(tool_use, "tool_input", {}),
+                        )
+                    )
+
             # Skip partial events — only process complete chunks
             if getattr(event, "is_partial", False):
                 continue
@@ -162,17 +186,6 @@ class ClaudeCliTransport(ProviderTransport):
             # Collect thinking content
             if getattr(event, "thinking", None):
                 thinking_parts.append(event.thinking)
-
-            # Collect tool use events
-            tool_use = getattr(event, "tool_use", None)
-            if tool_use is not None:
-                tool_calls.append(
-                    build_tool_call(
-                        id=getattr(tool_use, "tool_id", None),
-                        name=getattr(tool_use, "tool_name", "unknown"),
-                        arguments=getattr(tool_use, "tool_input", {}),
-                    )
-                )
 
             # Collect text from assistant and result events
             text = getattr(event, "text", None)

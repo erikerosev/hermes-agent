@@ -126,6 +126,14 @@ EXPOSED_TOOLS: tuple[str, ...] = (
     "image_generate",
     "skill_view",
     "skills_list",
+    # Skill WRITE surface. Without it the assistant can read its skill library
+    # but never extend it, so the "turn a proven approach into a skill" half of
+    # self-improvement was unreachable from the claude-cli path — only the
+    # background capture plugin could create skills. skill_manage is NOT an
+    # _AGENT_LOOP_TOOL, so a stateless MCP callback can dispatch it.
+    # NB: foreground writes get provenance="foreground" (see tools/skill_provenance.py),
+    # i.e. they count as user-owned and the curator will never auto-prune them.
+    "skill_manage",
     "text_to_speech",
     # Scheduling: cronjob is stateless-dispatchable (NOT in _AGENT_LOOP_TOOLS),
     # so the moat can drive it. Exposed so the assistant can actually schedule
