@@ -77,9 +77,14 @@ class ClaudeCliRunner:
         self,
         command: str = "claude",
         working_dir: str | None = None,
+        apollo_session_id: str | None = None,
     ) -> None:
         self.command = command
         self.working_dir = working_dir
+        # Az Apollo/fenris session (= thread) azonosítója. NEM a claude --resume id-je:
+        # ez a hívó oldali szál, amit az MCP-szerverek megkapnak (pl. az emlékeztető
+        # ehhez a beszélgetéshez kötődik → a push a helyes szálba deep-linkel).
+        self.apollo_session_id = apollo_session_id
         self._process: asyncio.subprocess.Process | None = None
         self._system_prompt_tempfile: str | None = None
         self._mcp_config_tempfile: str | None = None
@@ -265,6 +270,32 @@ class ClaudeCliRunner:
         mcp_config = None if no_mcp else self._build_hermes_tools_mcp_config()
         if mcp_config:
             args.extend(["--mcp-config", mcp_config, "--strict-mcp-config"])
+
+        # Web-tool arbitrázs. A beépített WebFetch nem tartalmat ad vissza,
+        # hanem LLM-összefoglalót: augusztusi mérésen 60 hívásból 19 hibázott
+        # (403/404 + kaszkádoló "sibling tool call errored"), a medián válasz
+        # 624 bájt parafrázis — a lap elveszik. A moat web_extract-je a valódi
+        # szöveget hozza (medián 4,2 KB) 0,5 s alatt, ezért ahol a moat jelen
+        # van, ott a WebFetch csak rosszabb utat kínál. Az aux-úton (no_mcp)
+        # NINCS web_extract, ott a WebFetch marad az egyetlen lehetőség.
+        #
+        # A WebSearch szándékosan MARAD: lassabb (medián 8,7 s a moat
+        # web_search 1,7 s-ához képest), de az Anthropic-index friss és
+        # niche kérdéseken jobb a lokális ddgs-backendnél, és a keresés
+        # minősége jog/egészség/pénzügy kérdéseknél nem csereszabatos.
+        # Felülírás: HERMES_CLAUDE_DISALLOWED_TOOLS (vesszős lista; üres
+        # string = semmit nem tiltunk).
+        _disallowed_raw = os.environ.get("HERMES_CLAUDE_DISALLOWED_TOOLS")
+        if _disallowed_raw is None:
+            disallowed = ["WebFetch"] if mcp_config else []
+        else:
+            disallowed = [t.strip() for t in _disallowed_raw.split(",") if t.strip()]
+        if disallowed:
+            # Egy vesszős tokenben adjuk át: a --disallowedTools variadikus,
+            # így a szóközös alak felfalná az utána jövő pozicionális
+            # argumentumokat (a bare `claude -p` a promptot is elnyelte a
+            # tesztben). Egy tokennel ez nem fordulhat elő.
+            args.extend(["--disallowedTools", ",".join(disallowed)])
 
         # System prompt: use a temp file for large prompts to avoid
         # exceeding OS argument-length limits.
@@ -541,6 +572,28 @@ class ClaudeCliRunner:
         # a WS-en), NEM ér el ide HERMES_PROFILE-ként (a gateway Hermes-profilja "default").
         # Egy távoli http-MCP olcsó (nincs lokális processz-spawn), ezért mindkét profilnak
         # elérhető; ha valaha kell a szűkítés, a fenris profile_id-t kell a runnerig vezetni.
+        # Emlékeztető-híd: Apollo emlékeztető-eszköze (create/list/cancel/snooze). A tár
+        # és az ütemező a fenris backendben él — a lejáratkor NEM fut modell, a felvett
+        # szöveg megy ki verbatim pusholva. Opt-in: HERMES_REMINDER_MCP a szerver útja.
+        # Az APOLLO_THREAD_ID-t azért adjuk át, hogy a lejáró emlékeztető pushja ABBA a
+        # beszélgetésbe vigyen, amelyikben felvették (a frontend a ?thread_id= deep-linket
+        # kezeli); a profilt a backend a threadből vezeti le.
+        reminder_script = os.environ.get("HERMES_REMINDER_MCP")
+        if reminder_script and Path(reminder_script).is_file():
+            reminder_env = {
+                "APOLLO_API_BASE": os.environ.get("APOLLO_API_BASE", "http://localhost:8001"),
+                "APOLLO_NOTIFY_TOKEN_PATH": os.environ.get(
+                    "APOLLO_NOTIFY_TOKEN_PATH",
+                    str(Path.home() / ".hermes" / "apollo_notify_token.txt"),
+                ),
+            }
+            if self.apollo_session_id:
+                reminder_env["APOLLO_THREAD_ID"] = str(self.apollo_session_id)
+            mcp_servers["reminders"] = {
+                "command": sys.executable,
+                "args": [reminder_script],
+                "env": reminder_env,
+            }
         atl = (os.environ.get("HERMES_ATLASSIAN_MCP") or "").strip()
         if atl:
             url = atl if atl.lower().startswith("http") else "https://mcp.atlassian.com/v1/mcp/authv2"

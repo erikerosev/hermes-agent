@@ -55,6 +55,24 @@ _RECYCLE_TURNS = int(os.environ.get("HERMES_CLAUDE_RECYCLE_TURNS", "8"))
 # processz kontextusa így indulásból is bounded; a teljes history a state.db-ben marad.
 _MAX_PRIME_CHARS = int(os.environ.get("HERMES_CLAUDE_MAX_PRIME_CHARS", "160000"))
 
+# A MANAGER által indított claude-processzek pid-jei (pid -> spawn-időpont).
+# CÉL: az árva-söprés meg tudja különböztetni a pool szivárgását a legitim,
+# spawn-per-turn `claude` gyerekektől (ClaudeCliRunner.run — kanban-workerek),
+# amik szintén a gateway gyerekei, de sosem kerülnek a _procs-ba. CSAK az itt
+# regisztrált pid-eket söpörjük, így egy futó kanban-taskot sosem lövünk ki.
+_SPAWNED: dict[int, float] = {}
+_SPAWNED_LOCK = threading.Lock()
+
+
+def _register_spawned(pid: int) -> None:
+    with _SPAWNED_LOCK:
+        _SPAWNED[pid] = time.time()
+
+
+def _unregister_spawned(pid: int) -> None:
+    with _SPAWNED_LOCK:
+        _SPAWNED.pop(pid, None)
+
 
 def enabled() -> bool:
     """Persistence CSAK interaktív sessionökre (Apollo gateway-út).
@@ -265,6 +283,13 @@ class _PersistentProc:
             self.popen.kill()
         except Exception:
             pass
+        # LE IS ARATJUK: wait() nélkül a megölt claude zombiként marad a gateway
+        # gyerekeként — PID-et foglal, és a ppid-sétás árva-söprés is látná.
+        try:
+            self.popen.wait(timeout=5)
+        except Exception:
+            pass
+        _unregister_spawned(self.popen.pid)
         try:
             self.runner._cleanup_tempfile()
         except Exception:
@@ -277,10 +302,14 @@ class ClaudeProcessManager:
         self._lock = threading.Lock()
 
     def _spawn(self, model: str, append_system_prompt: str | None,
-               working_dir: str | None, thinking_tokens=None) -> _PersistentProc:
+               working_dir: str | None, thinking_tokens=None,
+               apollo_session_id: str | None = None) -> _PersistentProc:
         runner = ClaudeCliRunner(
             command=os.environ.get("HERMES_CLAUDE_COMMAND", "claude"),
             working_dir=working_dir,
+            # A pool kulcsa = az Apollo session (thread). A processz EGY sessiont szolgál
+            # ki, ezért az MCP-szerverek env-jébe biztonságos beletenni (deep-link).
+            apollo_session_id=apollo_session_id,
         )
         # session_id=None → NINCS --resume; a kontextus a live processzben él.
         args = runner._build_args(model, append_system_prompt, session_id=None)
@@ -293,6 +322,7 @@ class ClaudeProcessManager:
             env=env, bufsize=0,
         )
         logger.info("persistent claude spawned: pid=%s", popen.pid)
+        _register_spawned(popen.pid)
         return _PersistentProc(popen, runner, model, append_system_prompt, thinking_tokens)
 
     def run_turn(self, *, session_id: str | None, prompt: str, model: str,
@@ -332,16 +362,21 @@ class ClaudeProcessManager:
                     proc.kill()
                 # FRISS (cold) processz indul — ez a ~7s, jelezzük a felhasználónak.
                 _status("starting")
-                proc = self._spawn(model, append_system_prompt, working_dir, thinking_tokens)
-                self._procs[key] = proc
+                proc = self._spawn(model, append_system_prompt, working_dir, thinking_tokens,
+                                   apollo_session_id=session_id)
+                self._install_locked(key, proc)
             self._reap_idle_locked()
             self._evict_over_cap_locked(protect=key)
+            self._sweep_orphans_locked()
         # Egy turn egyszerre ezen a processzen (más session párhuzamos).
         with proc.lock:
             if not proc.is_running():
                 with self._lock:
-                    proc = self._spawn(model, append_system_prompt, working_dir, thinking_tokens)
-                    self._procs[key] = proc
+                    proc = self._spawn(model, append_system_prompt, working_dir, thinking_tokens,
+                                   apollo_session_id=session_id)
+                    # _install_locked, NEM nyers értékadás: egy párhuzamos turn
+                    # közben ide ÉLŐ processzt tehetett a kulcsra.
+                    self._install_locked(key, proc)
 
             def _payload(p) -> str:
                 # FRISS (még nem primingolt) processz: a state.db-ből kapott előzményt
@@ -362,8 +397,11 @@ class ClaudeProcessManager:
                     logger.warning("persistent claude send failed (%s) — respawning", exc)
                     proc.kill()
                     with self._lock:
-                        proc = self._spawn(model, append_system_prompt, working_dir, thinking_tokens)
-                        self._procs[key] = proc
+                        proc = self._spawn(model, append_system_prompt, working_dir, thinking_tokens,
+                                   apollo_session_id=session_id)
+                        # A fenti proc.kill() a LOKÁLIS változót ölte meg; a kulcson
+                        # ettől függetlenül élhet másik processz (párhuzamos turn).
+                        self._install_locked(key, proc)
                     proc.busy = True
                     proc.send(_payload(proc))
                 # A prompt elment, a model dolgozik — "Gondolkodik…" az első tokenig.
@@ -375,6 +413,67 @@ class ClaudeProcessManager:
                 return events
             finally:
                 proc.busy = False
+
+    def _install_locked(self, key: str, proc: "_PersistentProc") -> None:
+        """A poolba tesz egy processzt — és ELŐBB kilövi, ami a kulcson volt.
+
+        EZ A 2026-08-18-i swap-halál javítása. A `self._procs[key] = proc` nyers
+        értékadás elveszítette a felülírt processzt: az ÉLT tovább (4 MCP-gyerekkel,
+        ~380 MB), de már nem volt a _procs-ban, ezért sem a _reap_idle_locked, sem
+        az _evict_over_cap_locked nem látta → a _MAX_PROCS cap és a TTL egyszerűen
+        nem vonatkozott rá. 77 ilyen árva halmozódott fel egy nap alatt (~29 GB).
+
+        Kiváltó ok: két routing key ugyanarra a session_id-ra mappelődik (lásd a
+        gateway `two routing keys are mapped to one session_id` tripwire-jét az
+        agent_runtime_helpers-ben), így párhuzamos turn-ök futnak EGY pool-kulcson,
+        és egymás bejegyzését írják felül."""
+        old = self._procs.get(key)
+        if old is not None and old is not proc:
+            # Csak az ÉLŐ felülírt processz árva — a már kilőttet csendben ejtjük.
+            if old.is_running():
+                logger.warning(
+                    "persistent claude: ÉLŐ processzt írtak volna felül a pool-kulcson "
+                    "(session=%s, pid=%s) — párhuzamos turn ugyanazon a sessionön; "
+                    "kilövöm, hogy ne szivárogjon el",
+                    key, getattr(old.popen, "pid", "?"))
+                try:
+                    old.kill()
+                except Exception:
+                    pass
+        self._procs[key] = proc
+
+    def _sweep_orphans_locked(self) -> None:
+        """Biztonsági háló: a manager által indított, de már egyetlen pool-kulcson
+        sem szereplő ÉLŐ claude-processzek kilövése.
+
+        Csak a _SPAWNED-ben regisztrált pid-eket nézi, ezért a spawn-per-turn
+        (ClaudeCliRunner.run, kanban-workerek) processzeit SOSEM bántja — azok
+        nincsenek regisztrálva. Így ha a jövőben új úton keletkezne árva, az itt
+        legkésőbb a következő turn-ön elbukik, nem halmozódik napokig."""
+        tracked = {getattr(p.popen, "pid", None) for p in self._procs.values()}
+        with _SPAWNED_LOCK:
+            candidates = [pid for pid in _SPAWNED if pid not in tracked]
+        for pid in candidates:
+            try:
+                alive = os.path.exists(f"/proc/{pid}")
+            except Exception:
+                alive = False
+            if not alive:
+                _unregister_spawned(pid)
+                continue
+            logger.warning(
+                "persistent claude: ÁRVA processz a poolon kívül (pid=%s) — kilövöm "
+                "a leszármazottaival együtt", pid)
+            for cpid in _descendant_pids(pid):
+                try:
+                    os.kill(cpid, signal.SIGKILL)
+                except Exception:
+                    pass
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except Exception:
+                pass
+            _unregister_spawned(pid)
 
     def _reap_idle_locked(self) -> None:
         now = time.time()

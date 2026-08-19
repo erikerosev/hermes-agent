@@ -6593,6 +6593,20 @@ class AIAgent:
             timeout=getattr(self, "timeout_seconds", 600),
         )
 
+        # A HÍVÓ system-promptja (fenris: profil-persona + kozos-retrieval + kép-kapu).
+        # A transport kiszedi a `system` üzenetből (`api_kwargs["system_prompt"]`), de
+        # ezen az ágon EDDIG SENKI NEM HASZNÁLTA, a `_render_history` pedig a role=system
+        # üzenetet kihagyja → Erik/Tündi personája, a közös-memória találatai és a kerti
+        # kép-blokk SOSE jutottak el a modellhez. (Tünet: magázás Erikkel, profil-vakság.)
+        # Ugyanaz a családi hiba, mint a többi claude-cli early-return csapda.
+        # A SOUL adja az IDENTITÁST; ez a LENCSE — kivel beszélsz és hogyan, ezért a
+        # prompt VÉGÉRE megy, a beszélgetéshez legközelebb. Kikapcs: HERMES_CALLER_PERSONA=0.
+        if os.environ.get("HERMES_CALLER_PERSONA", "1").strip().lower() not in ("0", "off", "false", "no"):
+            _caller_system = (api_kwargs.get("system_prompt")
+                              or getattr(self, "ephemeral_system_prompt", "") or "").strip()
+            if _caller_system:
+                append_system_prompt = ((append_system_prompt or "") + "\n\n" + _caller_system).strip()
+
         runner = ClaudeCliRunner(
             command=getattr(self, "_claude_cli_command", "claude"),
             working_dir=api_kwargs.get("working_dir"),
@@ -6861,15 +6875,18 @@ class AIAgent:
         except Exception:
             pass
 
-        # Skills index (if curator is active)
-        curator = getattr(self, "_curator", None)
-        if curator:
+        # Skills index. FIGYELEM: eddig `self._curator`-ból épült, de az az attribútum
+        # SEHOL nem kap értéket → az ág holt kód volt, és a claude-cli úton futó agent
+        # (Apollo) EGYETLEN skillt sem látott felsorolva. A skill_view/skills_list MCP-tool
+        # működött, csak nem volt miből tudnia, mi létezik. 2026-08-18: a modul-szintű
+        # build_skills_system_prompt()-ot hívjuk. Kikapcsolás: HERMES_SKILLS_INDEX=0.
+        if os.environ.get("HERMES_SKILLS_INDEX", "1").strip().lower() not in ("0", "off", "false", "no"):
             try:
-                skills_prompt = curator.build_skills_system_prompt()
+                skills_prompt = build_skills_system_prompt()
                 if skills_prompt:
-                    parts.append(f"## Active Skills\n{skills_prompt}")
+                    parts.append(skills_prompt)   # saját fejlécet hoz ("## Skills (mandatory)")
             except Exception:
-                pass
+                logger.debug("skills index build failed", exc_info=True)
 
         # Memory system guidance
         parts.append(
