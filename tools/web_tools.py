@@ -785,6 +785,12 @@ async def web_extract_tool(
     Raises:
         Exception: If extraction fails or API key is not set
     """
+    if not urls:
+        return json.dumps({
+            "error": "No URL given. Pass `urls` (a list) or `url` (a single "
+                     "URL string).",
+        })
+
     # Block URLs containing embedded secrets (exfiltration prevention).
     # URL-decode first so percent-encoded secrets (%73k- = sk-) are caught.
     from agent.redact import _PREFIX_RE
@@ -1201,6 +1207,27 @@ WEB_SEARCH_SCHEMA = {
     }
 }
 
+def _normalize_extract_urls(args: Dict[str, Any]) -> List[Any]:
+    """Accept both `urls` (list) and the singular `url` alias.
+
+    Claude reaches for `url` roughly as often as `urls` — before this, such a
+    call died at the MCP arg-validation boundary with a pydantic error, and any
+    sibling tool call in the same block died with it ("Sibling tool call
+    errored"). One dropped keystroke cost a whole parallel batch, so both
+    spellings are accepted; `urls` wins when both are present.
+    """
+    raw = args.get("urls")
+    if raw is None:
+        raw = args.get("url")
+    if raw is None:
+        return []
+    if isinstance(raw, (str, dict)):
+        return [raw]
+    if isinstance(raw, list):
+        return raw
+    return []
+
+
 WEB_EXTRACT_SCHEMA = {
     "name": "web_extract",
     "description": "Extract content from web page URLs. Returns clean page content in markdown/text (no LLM summarization — fast). Also works with PDF URLs (arxiv papers, documents) — pass the PDF link directly. Pages within the char budget (default 15000) return whole; larger pages return a head+tail window with a footer telling you the full text's saved file path and the read_file call to page through the omitted middle. Inline images appear as [IMAGE: alt] placeholders; real image URLs are kept as links. If a URL fails or times out, use the browser tool instead.",
@@ -1213,13 +1240,17 @@ WEB_EXTRACT_SCHEMA = {
                 "description": "List of URLs to extract content from (max 5 URLs per call)",
                 "maxItems": 5
             },
+            "url": {
+                "type": "string",
+                "description": "Convenience alias for a single URL. Either `urls` or `url` must be given; `urls` wins if both are present."
+            },
             "char_limit": {
                 "type": "integer",
                 "description": "Optional per-page character budget sent back (default 15000). Pages larger than this are head+tail truncated with the full text stored to disk. Raise it when you need more of a long page inline.",
                 "minimum": 2000
             }
         },
-        "required": ["urls"]
+        "required": []
     }
 }
 
@@ -1238,7 +1269,7 @@ registry.register(
     toolset="web",
     schema=WEB_EXTRACT_SCHEMA,
     handler=lambda args, **kw: web_extract_tool(
-        args.get("urls", [])[:5] if isinstance(args.get("urls"), list) else [],
+        _normalize_extract_urls(args)[:5],
         "markdown",
         char_limit=args.get("char_limit"),
     ),

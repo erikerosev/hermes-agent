@@ -1,0 +1,6 @@
+name: comfyui
+version: 1.0.0
+description: "Local ComfyUI image generation backend — runs SDXL/Juggernaut XL on RTX 3060 via ComfyUI REST API."
+author: local
+kind: backend
+requires_env: []

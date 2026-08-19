@@ -4832,6 +4832,19 @@ class APIServerAdapter(BasePlatformAdapter):
                     )
                     if agent_ref is not None:
                         agent_ref[0] = agent
+                    # Aux-sentinel bekötés. `_resolve_aux_model` felismeri az
+                    # apollo-aux modellt és idáig eljuttatja a flaget, de a
+                    # run_agent-oldali könnyű út a `self._aux_lightweight`
+                    # ATTRIBÚTUMOT olvassa — a paraméter beállítása nélkül az
+                    # mindig False maradt, így MINDEN side-task teljes
+                    # agent-turnként futott (persona + memória + naplo +
+                    # on_session_end hook). A naplo-provider ilyenkor az
+                    # aux-turnre is aktiválódott, az pedig a saját végén újabb
+                    # naplo-hívást indított: önfenntartó rekurzió, ami elvitte
+                    # a `max_concurrent_runs` slotokat a valódi user-turn elől
+                    # (429 "Too many concurrent runs"). Lásd run_agent.py
+                    # "Könnyű aux-út" blokk.
+                    self._apply_aux_sentinel(agent, aux_lightweight, aux_model)
                     effective_task_id = session_id or str(uuid.uuid4())
                     result = agent.run_conversation(
                         user_message=user_message,
@@ -4853,12 +4866,59 @@ class APIServerAdapter(BasePlatformAdapter):
                 finally:
                     clear_session_vars(tokens)
 
+        # ── Turn lease (#64934) ────────────────────────────────────────
+        # Az API-út SAJÁT dispatch: nem megy át a GatewayRunner._handle_message-en,
+        # ezért az ott (run.py) megszerzett per-session turn-lease erre a route-ra
+        # SOSEM vonatkozott. Így két párhuzamos API-kérés ugyanarra a session_id-ra
+        # egyszerre futtatott turn-t — ez a `two routing keys are mapped to one
+        # session_id` tripwire, ami 2026-08-18-án 189-szer tüzelt.
+        #
+        # Miért ütközik egyáltalán két kérés EGY session_id-n: a _derive_chat_session_id
+        # a (system prompt + első user-üzenet) hashéből képzi az id-t, tehát EGY
+        # beszélgetés minden kérése ugyanazt az id-t kapja — de külön routing key-t.
+        # Egy retry, egy második fül vagy egy újracsatlakozó stream-kliens elég hozzá.
+        #
+        # Következmény a transzkripten túl: minden párhuzamos turn saját claude-processzt
+        # kért a pool EGYETLEN kulcsán, és felülírta az előzőt → élő, nyomon követetlen
+        # processzek (lásd agent/claude_process_manager._install_locked).
+        #
+        # Nincs újrabelépés: a _run_agent minden hívója top-level HTTP-handler, a
+        # tényleges futás executor-szálon megy (onnan nem lehet ide visszahívni),
+        # ezért a lease-t nem lehet önmagára várakoztatni.
+        _lease_registry = None
+        _lease_token = None
+        if session_id:
+            try:
+                from gateway.run import _gateway_runner_ref, _float_env as _lease_float_env
+                _gw = getattr(self, "gateway_runner", None) or _gateway_runner_ref()
+                _lease_registry = getattr(_gw, "_turn_leases", None)
+            except Exception:
+                _lease_registry = None
+        if _lease_registry is not None:
+            try:
+                self._turn_lease_generation = getattr(self, "_turn_lease_generation", 0) + 1
+                _lease_token = await _lease_registry.acquire(
+                    session_id,
+                    owner_key=gateway_session_key or session_id,
+                    generation=self._turn_lease_generation,
+                    timeout=_lease_float_env("HERMES_AGENT_TIMEOUT", 1800),
+                )
+            except Exception:
+                # Fail-open: a lease sosem akadályozhatja meg a kérés kiszolgálását.
+                logger.exception("[API] turn lease acquire failed — a turn sorosítás nélkül fut")
+                _lease_token = None
+
         self._activate_admitted_request()
         self._inflight_agent_runs += 1
         try:
             return await loop.run_in_executor(None, _run)
         finally:
             self._inflight_agent_runs -= 1
+            if _lease_token is not None and _lease_registry is not None:
+                try:
+                    _lease_registry.release(_lease_token)
+                except Exception:
+                    logger.exception("[API] turn lease release failed")
 
     def _get_aux_semaphore(self) -> "asyncio.Semaphore":
         """Lazy, event-loop-kötött szemafor az aux-turnökhöz (HERMES_AUX_MAX_CONCURRENCY, def. 2)."""
@@ -4871,6 +4931,26 @@ class APIServerAdapter(BasePlatformAdapter):
             sem = asyncio.Semaphore(limit)
             self._aux_semaphore = sem
         return sem
+
+    @staticmethod
+    def _apply_aux_sentinel(agent, aux_lightweight: bool, aux_model) -> None:
+        """Hand the resolved aux-sentinel decision to the agent object.
+
+        ``_resolve_aux_model`` detects the sentinel and ``_run_agent`` receives
+        it as a parameter, but the light path in ``run_agent.py`` reads the
+        ``_aux_lightweight`` ATTRIBUTE. Without this assignment the parameter
+        was inert, so every side task ran as a FULL agent turn — persona,
+        memory providers, and the ``on_session_end`` hook included. The naplo
+        memory provider then activated on the aux turn too, and that turn's own
+        session end fired another naplo call: a self-sustaining loop that ate
+        the ``max_concurrent_runs`` slots out from under real user turns
+        (429 "Too many concurrent runs"). Keep this call adjacent to agent
+        construction; the light path is unreachable without it.
+        """
+        if not aux_lightweight:
+            return
+        agent._aux_lightweight = True
+        agent._aux_model = aux_model
 
     @staticmethod
     def _resolve_aux_model(model_name) -> tuple:
