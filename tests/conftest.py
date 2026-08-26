@@ -330,6 +330,29 @@ _HERMES_BEHAVIORAL_VARS = frozenset({
 
 
 @pytest.fixture(autouse=True)
+def _reset_auxiliary_caches():
+    """Clear auxiliary_client's module-level provider caches between tests.
+
+    ``auxiliary_client`` keeps two process-wide caches — the payment-error
+    unhealthy marks and the consecutive-timeout circuit breaker. Both are
+    deliberately global (a depleted account or a hung endpoint stays that way
+    across calls), which means a test that trips one leaks into every test
+    that runs after it: the next test's provider gets silently skipped and it
+    fails with an unrelated-looking error. Until this fixture existed, a few
+    test classes reset the cache by hand in setUp and the rest were simply
+    ordering-dependent.
+    """
+    try:
+        from agent.auxiliary_client import _reset_aux_unhealthy_cache
+    except Exception:
+        yield
+        return
+    _reset_aux_unhealthy_cache()
+    yield
+    _reset_aux_unhealthy_cache()
+
+
+@pytest.fixture(autouse=True)
 def _hermetic_environment(tmp_path, monkeypatch):
     """Blank out all credential/behavioral env vars so local and CI match.
 

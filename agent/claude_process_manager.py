@@ -24,7 +24,11 @@ import subprocess
 import threading
 import time
 
-from agent.claude_cli_runner import ClaudeCliRunner
+from agent.claude_cli_runner import (
+    ClaudeCliRunner,
+    _STALL_NOTICE_SECONDS,
+    _STALL_REPEAT_SECONDS,
+)
 from claude_code_core.parser import parse_line
 from claude_code_core.types import MessageType, StreamEvent
 
@@ -227,11 +231,43 @@ class _PersistentProc:
         # Amíg tiszta `result`-tal nem zárunk, a processz KOSZOS marad (a hívó félbeszakíthat,
         # timeout lehet) → a következő acquire recycle-öli, hogy ne olvasson leszakadt maradékot.
         self.dirty = True
+        # Stall-figyelő. Ez az az út, amin 2026-08-24-én a felhasználó 3 percig
+        # nézte a semmit: a claude fönt 529-eket kapott és csendben újrapróbált,
+        # ide egyetlen sor sem érkezett. A queue-poll amúgy is 5 mp-enként ébred,
+        # így a jelzés ingyen van — csak on_thinking-et hív, a folyamot nem érinti.
+        last_activity = time.time()
+        stall_notified = False
         while time.time() < deadline:
+            # A poll-intervallum szabja meg, milyen pontosan tudunk stallt
+            # jelezni (a jelzés csak az Empty-ágon születik), ezért a
+            # küszöbnél hosszabbat sosem várunk. Éles beállításnál (30s
+            # küszöb) ez az 5.0-t hagyja érvényben — csak a rövid, tesztelt
+            # küszöböknél szorít.
+            _poll = min(5.0, max(0.1, deadline - time.time()))
+            if on_thinking is not None and _STALL_NOTICE_SECONDS > 0:
+                _poll = min(_poll, max(0.1, _STALL_NOTICE_SECONDS))
             try:
-                raw = self._q.get(timeout=min(5.0, max(0.1, deadline - time.time())))
+                raw = self._q.get(timeout=_poll)
             except queue.Empty:
+                idle = time.time() - last_activity
+                threshold = (_STALL_NOTICE_SECONDS if not stall_notified
+                             else _STALL_NOTICE_SECONDS + _STALL_REPEAT_SECONDS)
+                if on_thinking is not None and _STALL_NOTICE_SECONDS > 0 and idle >= threshold:
+                    stall_notified = True
+                    last_activity = time.time()
+                    logger.info(
+                        "persistent claude: no output for %.0fs (pid=%s) — likely retrying upstream",
+                        idle, self.popen.pid,
+                    )
+                    try:
+                        on_thinking(
+                            f"[{int(idle)} másodperce nincs válasz az API-tól — "
+                            f"valószínűleg újrapróbálkozik. Még várok.]"
+                        )
+                    except Exception:
+                        pass
                 continue
+            last_activity = time.time()
             if raw is None:  # EOF — a processz meghalt
                 self._alive = False
                 break

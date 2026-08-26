@@ -1092,6 +1092,24 @@ def _handle_create(args: dict, **kw) -> str:
             "assignee is required — name the profile that should execute this "
             "task (the dispatcher will only spawn tasks with an assignee)"
         )
+    # Apollo-kontextus (APOLLO_DELEGATION_ACTIVE): ott az ügynök-munkának kötődnie
+    # KELL a beszélgetéshez, különben az eredmény némán elveszik — 2026-08-25-én
+    # a t_08a4c656 rendben lefutott, és senki nem kapta meg, mert ez az út nem
+    # regisztrál visszacsatolást. Ezért itt csak EMBERI teendő hozható létre
+    # (nem indítható assignee); az ügynök-munka a `delegate_task` dolga.
+    if os.environ.get("APOLLO_DELEGATION_ACTIVE"):
+        try:
+            from hermes_cli.profiles import profile_exists as _pe
+        except Exception:
+            _pe = None
+        if _pe is not None and _pe(str(assignee).strip()):
+            return tool_error(
+                f"'{assignee}' végrehajtó ügynök — ezt a `delegate_task` toollal "
+                "add ki, ne a kanban_create-tel. Csak a delegate_task köti az "
+                "eredményt ehhez a beszélgetéshez; a kanban_create-tel kiadott "
+                "ügynök-munka eredménye némán elveszne. A kanban_create emberi "
+                "teendőkre való (pl. assignee='erik')."
+            )
     body = args.get("body")
     parents = args.get("parents") or []
     tenant = args.get("tenant") or os.environ.get("HERMES_TENANT")

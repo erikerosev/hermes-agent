@@ -2961,6 +2961,10 @@ class APIServerAdapter(BasePlatformAdapter):
             # X-Hermes-Thinking-Tokens headerben küldi). Felülírja az env-defaultot.
             _thinking_hdr = request.headers.get("X-Hermes-Thinking-Tokens", "").strip() or None
             agent_ref = [None]
+            # Aux slot: bound simultaneous side tasks so they cannot crowd real
+            # turns out of _max_concurrent_runs (see _acquire_aux_slot).
+            if _is_aux and not await self._acquire_aux_slot():
+                return self._aux_saturated_response()
             agent_task = asyncio.ensure_future(self._run_agent(
                 user_message=user_message,
                 conversation_history=history,
@@ -2983,6 +2987,10 @@ class APIServerAdapter(BasePlatformAdapter):
             # Ensure SSE drain loops can terminate without relying on polling
             # agent_task.done(), which can race with queue timeout checks.
             agent_task.add_done_callback(lambda _fut: _stream_q.put(None))
+            # Free the aux slot when the run ends — including cancellation, so a
+            # client that hangs up mid-stream cannot leak the slot forever.
+            if _is_aux:
+                agent_task.add_done_callback(lambda _fut: self._release_aux_slot())
 
             return await self._write_sse_chat_completion(
                 request, completion_id, model_name, created, _stream_q,
@@ -3004,26 +3012,36 @@ class APIServerAdapter(BasePlatformAdapter):
                 pinned_session=bool(provided_session_id),
             )
 
-        idempotency_key = request.headers.get("Idempotency-Key")
-        if idempotency_key:
-            fp = _make_request_fingerprint(body, keys=["model", "messages", "tools", "tool_choice", "stream"])
-            try:
-                result, usage = await _idem_cache.get_or_set(idempotency_key, fp, _compute_completion)
-            except Exception as e:
-                logger.error("Error running agent for chat completions: %s", e, exc_info=True)
-                return web.json_response(
-                    _openai_error(f"Internal server error: {e}", err_type="server_error"),
-                    status=500,
-                )
-        else:
-            try:
-                result, usage = await _compute_completion()
-            except Exception as e:
-                logger.error("Error running agent for chat completions: %s", e, exc_info=True)
-                return web.json_response(
-                    _openai_error(f"Internal server error: {e}", err_type="server_error"),
-                    status=500,
-                )
+        # Aux slot (non-streaming): the same bound as the streaming path. It is
+        # held only across the dispatch below, and released in `finally` so an
+        # Idempotency-Key cache hit — which returns without running the agent —
+        # cannot leak it.
+        if _is_aux and not await self._acquire_aux_slot():
+            return self._aux_saturated_response()
+        try:
+            idempotency_key = request.headers.get("Idempotency-Key")
+            if idempotency_key:
+                fp = _make_request_fingerprint(body, keys=["model", "messages", "tools", "tool_choice", "stream"])
+                try:
+                    result, usage = await _idem_cache.get_or_set(idempotency_key, fp, _compute_completion)
+                except Exception as e:
+                    logger.error("Error running agent for chat completions: %s", e, exc_info=True)
+                    return web.json_response(
+                        _openai_error(f"Internal server error: {e}", err_type="server_error"),
+                        status=500,
+                    )
+            else:
+                try:
+                    result, usage = await _compute_completion()
+                except Exception as e:
+                    logger.error("Error running agent for chat completions: %s", e, exc_info=True)
+                    return web.json_response(
+                        _openai_error(f"Internal server error: {e}", err_type="server_error"),
+                        status=500,
+                    )
+        finally:
+            if _is_aux:
+                self._release_aux_slot()
 
         final_response = _resolve_media_to_data_urls(result.get("final_response") or "")
         is_partial = bool(result.get("partial"))
@@ -4827,6 +4845,22 @@ class APIServerAdapter(BasePlatformAdapter):
                         tool_progress_callback=tool_progress_callback,
                         tool_start_callback=tool_start_callback,
                         tool_complete_callback=tool_complete_callback,
+                        # Ez a négy paraméter eddig CSAK a szignatúrában létezett:
+                        # a hívó (a /v1 SSE-ág, 2968) átadta őket, de itt nem
+                        # mentek tovább, így az AIAgent status/thinking callback
+                        # nélkül épült, a clarify "unavailable in this execution
+                        # context"-et jelentett, a thinking-budget pedig mindig
+                        # None maradt → a runner az env-defaultra (0) esett vissza.
+                        # Következmény: a UI „Élő gondolatmenet" kapcsolója NÉMÁN
+                        # hatástalan volt, és a process-manager toggle-respawnja
+                        # sem tüzelhetett (a budget sosem változott). Bizonyíték:
+                        # 1665 claude-transcriptből 8-ban van thinking-blokk, mind
+                        # a feature építésének két napjáról (2026-07-20/21) — azóta
+                        # nulla, három élő próbán sem indult respawn.
+                        clarify_callback=clarify_callback,
+                        status_callback=status_callback,
+                        thinking_callback=thinking_callback,
+                        thinking_tokens=thinking_tokens,
                         gateway_session_key=gateway_session_key,
                         route=route,
                     )
@@ -4931,6 +4965,77 @@ class APIServerAdapter(BasePlatformAdapter):
             sem = asyncio.Semaphore(limit)
             self._aux_semaphore = sem
         return sem
+
+    @staticmethod
+    def _aux_acquire_timeout() -> float:
+        """Seconds a side task may wait for a free aux slot (0 = wait forever)."""
+        try:
+            return float(os.environ.get("HERMES_AUX_ACQUIRE_TIMEOUT", "30"))
+        except (TypeError, ValueError):
+            return 30.0
+
+    async def _acquire_aux_slot(self) -> bool:
+        """Take one of the bounded aux slots; False if none came free in time.
+
+        `_max_concurrent_runs` bounds ALL in-flight work but cannot tell a user
+        turn from a background one — first come, first served. That is how the
+        naplo loop took all ten slots on 2026-08-18 and 429'd the person who was
+        actually typing. This semaphore reserves the difference: at most
+        HERMES_AUX_MAX_CONCURRENCY (default 2) side tasks run at once, so the
+        remaining slots always belong to real turns.
+
+        The acquire timeout is not decoration. A slot is held across a whole
+        subprocess turn, so without it a wedged aux run would park every later
+        side task in an unbounded queue — and any future aux→aux nesting would
+        deadlock outright. Timing out lets the caller fail and retry instead.
+        The hold side is bounded independently by the runner's own timeout.
+        """
+        sem = self._get_aux_semaphore()
+        timeout = self._aux_acquire_timeout()
+        waited_from = time.monotonic()
+        try:
+            if timeout > 0:
+                await asyncio.wait_for(sem.acquire(), timeout=timeout)
+            else:
+                await sem.acquire()
+        except asyncio.TimeoutError:
+            logger.warning(
+                "[API] aux slot unavailable after %.0fs (HERMES_AUX_MAX_CONCURRENCY=%s) "
+                "— rejecting the side task so it does not queue behind a wedged run",
+                timeout, os.environ.get("HERMES_AUX_MAX_CONCURRENCY", "2"),
+            )
+            return False
+        waited = time.monotonic() - waited_from
+        if waited > 1.0:
+            logger.info("[API] aux slot acquired after %.1fs wait", waited)
+        return True
+
+    def _release_aux_slot(self) -> None:
+        """Release a slot taken by _acquire_aux_slot (never raises)."""
+        sem = getattr(self, "_aux_semaphore", None)
+        if sem is None:
+            return
+        try:
+            sem.release()
+        except Exception:
+            logger.exception("[API] aux slot release failed")
+
+    def _aux_saturated_response(self) -> "web.Response":
+        """429 for a side task that could not get a slot.
+
+        Same envelope as `_concurrency_limited_response` so the auxiliary
+        client's existing rate-limit branch handles it (and logs it) rather
+        than seeing an opaque 5xx.
+        """
+        return web.json_response(
+            _openai_error(
+                "Too many concurrent auxiliary runs",
+                err_type="rate_limit_error",
+                code="rate_limit_exceeded",
+            ),
+            status=429,
+            headers={"Retry-After": "5"},
+        )
 
     @staticmethod
     def _apply_aux_sentinel(agent, aux_lightweight: bool, aux_model) -> None:

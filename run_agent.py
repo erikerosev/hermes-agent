@@ -65,6 +65,31 @@ from types import SimpleNamespace
 from hermes_constants import get_hermes_home
 
 
+def _humanize_claude_cli_error(normalized) -> None:
+    """Rewrite a raw upstream-error blob in ``normalized.content`` in place.
+
+    The claude CLI reports a give-up after its retry budget by emitting the raw
+    provider JSON *as the assistant's message* — the user reads
+    ``API Error: 529 {"type":"error",…}`` where an answer should be. Swap in a
+    sentence before this reaches the UI, the naplo write-back or memory.
+    Non-error content and unrecognised codes pass through untouched.
+    """
+    try:
+        from agent.claude_cli_runner import humanize_cli_error
+    except Exception:
+        return
+    try:
+        original = getattr(normalized, "content", None)
+        if not original:
+            return
+        replaced = humanize_cli_error(original)
+        if replaced != original:
+            logger.warning("claude-cli upstream error surfaced to user: %.120s", original)
+            normalized.content = replaced
+    except Exception:
+        logger.debug("humanize_claude_cli_error failed", exc_info=True)
+
+
 def _launch_cwd_for_session(source: str) -> Optional[str]:
     """Working directory to stamp on a new session row, or None.
 
@@ -6508,6 +6533,7 @@ class AIAgent:
                 no_mcp=True,
             ))
             normalized = transport.normalize_response(events)
+            _humanize_claude_cli_error(normalized)
             if self.stream_delta_callback:
                 try:
                     if normalized.content:
@@ -6740,6 +6766,10 @@ class AIAgent:
 
         # ── 5. Normalize response ─────────────────────────────────
         normalized = transport.normalize_response(events)
+        # A claude CLI a feladott upstream hibát nyers JSON-ként adja vissza
+        # ASSZISZTENS-VÁLASZKÉNT ("API Error: 529 {…}"). Emberi mondatra
+        # cseréljük, mielőtt bárhová (UI, napló, memória) eljutna.
+        _humanize_claude_cli_error(normalized)
 
         # Store CC session_id for multi-turn resume — per-instance (régi) ÉS perzisztens
         # (threadhez kötve, túléli a gateway-restartot). A perzisztens a következő turn

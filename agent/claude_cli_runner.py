@@ -31,6 +31,122 @@ _STRIPPED_ENV_KEYS = frozenset({
 })
 
 
+# ── Stall watchdog + human-readable upstream errors ───────────────────────
+#
+# On 2026-08-24 an upstream 529 wave made every gateway turn sit silent for
+# exactly 180s (the CLI's own retry budget) and then hand the user this, as
+# the assistant's answer:
+#
+#   API Error: 529 {"type":"error","error":{"type":"overloaded_error", …}}
+#
+# Two separate defects. The wait was invisible — nothing distinguished
+# "retrying upstream" from "thinking hard" or "wedged" — and the payoff was
+# raw JSON. The watchdog fixes the first by narrating the stall into the
+# thinking panel; ``humanize_cli_error`` fixes the second.
+
+# How long without a single stdout line before we tell the user something.
+_STALL_NOTICE_SECONDS = float(os.environ.get("HERMES_CLAUDE_STALL_NOTICE", "30"))
+# How often to repeat the notice while the stall continues.
+_STALL_REPEAT_SECONDS = float(os.environ.get("HERMES_CLAUDE_STALL_REPEAT", "45"))
+
+_API_ERROR_RE = re.compile(
+    r"^\s*API Error:\s*(?P<code>\d{3})\b(?P<rest>.*)$", re.DOTALL
+)
+_REQUEST_ID_RE = re.compile(r'"request_id"\s*:\s*"(?P<rid>[^"]+)"')
+
+# Only codes where the raw JSON tells the user nothing they can act on.
+# Anything else keeps its original text — inventing a friendly paraphrase for
+# an error we do not recognise would hide detail that matters when debugging.
+_API_ERROR_HUMAN = {
+    "429": "Az API rate limitre futott (429) — túl sok kérés rövid idő alatt.",
+    "500": "Az API belső hibát adott (500).",
+    "502": "Az API átjárója hibázott (502).",
+    "503": "Az API átmenetileg nem elérhető (503).",
+    "529": "Az Anthropic API jelenleg túlterhelt (529) — ez náluk van, nem nálunk.",
+}
+
+
+def humanize_cli_error(text: str) -> str:
+    """Turn a raw ``API Error: <code> {json}`` blob into a sentence.
+
+    Returns ``text`` unchanged when it is not one of the recognised upstream
+    errors, so normal answers — and unfamiliar errors, whose detail is worth
+    more than a vague paraphrase — pass through untouched.
+    """
+    if not text or "API Error:" not in text:
+        return text
+    m = _API_ERROR_RE.match(text)
+    if not m:
+        return text
+    human = _API_ERROR_HUMAN.get(m.group("code"))
+    if not human:
+        return text
+
+    out = [human, "Nem a te kérdéseddel van baj — egyetlen token sem készült el."]
+    rid = _REQUEST_ID_RE.search(m.group("rest") or "")
+    if rid:
+        out.append(f"(request_id: {rid.group('rid')})")
+    out.append("Küldd el újra; ha percekig ismétlődik, az upstream kiesés.")
+    return " ".join(out)
+
+
+_CLAUDE_BIN_LOGGED = False
+
+
+def _resolve_claude_command(explicit: str | None = None) -> str:
+    """Pick which ``claude`` binary to spawn.
+
+    The gateway is launched from a shell whose PATH does NOT contain
+    ``~/.local/bin`` (it is ``…/agent-venv/bin:/usr/local/sbin:/usr/local/bin:
+    /usr/sbin:/usr/bin:/bin:/snap/bin``). A bare ``claude`` therefore resolved
+    to ``/usr/bin/claude`` — a stale *npm-global* install that never
+    self-updates. On 2026-08-24 that was 2.1.49 while the user's own shell ran
+    2.1.241, ~190 versions newer: the gateway had been silently running a
+    months-old client. The npm-global copy is not on any update path, so this
+    drift only ever grows.
+
+    Resolution order, first hit wins:
+      1. ``HERMES_CLAUDE_BIN`` — explicit override, no questions asked.
+      2. ``~/.local/bin/claude`` — the official installer's location, which
+         self-updates. This is what makes the fix durable rather than a
+         one-off ``npm -g update``.
+      3. ``shutil.which("claude")`` — whatever PATH offers.
+      4. the literal string, so the failure mode stays the old one.
+
+    An explicit ``command`` argument from the caller always wins over all of
+    the above; only the default is resolved here.
+    """
+    global _CLAUDE_BIN_LOGGED
+
+    if explicit and explicit != "claude":
+        return explicit
+
+    resolved: str | None = None
+    override = os.environ.get("HERMES_CLAUDE_BIN")
+    if override:
+        if os.access(override, os.X_OK):
+            resolved = override
+        else:
+            logger.warning(
+                "HERMES_CLAUDE_BIN=%s is not executable; falling back to PATH",
+                override,
+            )
+
+    if resolved is None:
+        local_bin = Path.home() / ".local" / "bin" / "claude"
+        if os.access(local_bin, os.X_OK):
+            resolved = str(local_bin)
+
+    if resolved is None:
+        resolved = shutil.which("claude") or "claude"
+
+    if not _CLAUDE_BIN_LOGGED:
+        _CLAUDE_BIN_LOGGED = True
+        logger.info("Claude CLI binary: %s", resolved)
+
+    return resolved
+
+
 def _resolve_windows_cmd(cmd_path: Path) -> list[str] | None:
     """Resolve a Windows npm .cmd/.bat wrapper to [node, cli_js].
 
@@ -75,11 +191,11 @@ class ClaudeCliRunner:
 
     def __init__(
         self,
-        command: str = "claude",
+        command: str | None = None,
         working_dir: str | None = None,
         apollo_session_id: str | None = None,
     ) -> None:
-        self.command = command
+        self.command = _resolve_claude_command(command)
         self.working_dir = working_dir
         # Az Apollo/fenris session (= thread) azonosítója. NEM a claude --resume id-je:
         # ez a hívó oldali szál, amit az MCP-szerverek megkapnak (pl. az emlékeztető
@@ -187,7 +303,8 @@ class ClaudeCliRunner:
     async def kill(self) -> None:
         """Terminate the subprocess, force-killing if it doesn't stop.
 
-        A claude gyermek MCP-szervereit (hermes_tools + kozos) IS kilőjük — claude nem
+        A claude gyermek MCP-szervereit (hermes_tools, kozos, behavior-rules,
+        reminders, delegation) IS kilőjük — claude nem
         mindig viszi őket magával SIGTERM-re, és minden lemaradt MCP-szerver felhalmozódik
         (turn-önként friss processz → leak → a gateway lassul/befullad). A gyerekeket a
         kill ELŐTT gyűjtjük (amíg a ppid-link él), és csak a VALÓDI Apollo-MCP-ket lőjük
@@ -217,7 +334,9 @@ class ClaudeCliRunner:
                 with open(f"/proc/{_cpid}/cmdline", "rb") as _f:
                     _cl = _f.read().decode("utf-8", "replace")
                 if ("hermes_tools_mcp_server" in _cl or "kozos_mcp_server" in _cl
-                        or "behavior_rules_mcp_server" in _cl):
+                        or "behavior_rules_mcp_server" in _cl
+                        or "reminder_mcp_server" in _cl
+                        or "delegate_mcp_server" in _cl):
                     _os.kill(_cpid, _signal.SIGKILL)
             except Exception:
                 pass
@@ -440,30 +559,71 @@ class ClaudeCliRunner:
         events: list[StreamEvent] = []
         line_count = 0
 
-        while True:
-            line = await self._process.stdout.readline()
-            if not line:
-                logger.info("Claude CLI stdout EOF after %d lines", line_count)
-                break
+        # Stall watchdog. Runs beside the reader rather than wrapping
+        # readline() in wait_for: cancelling a StreamReader mid-line is a
+        # needless risk when all the watchdog needs is a timestamp. It only
+        # ever calls on_thinking, so a silent turn is impossible to confuse
+        # with a wedged one.
+        last_activity = [asyncio.get_running_loop().time()]
+        watchdog: asyncio.Task | None = None
 
-            line_count += 1
-            decoded = line.decode("utf-8", errors="replace")
-
-            if line_count <= 3:
-                logger.info(
-                    "Claude CLI stdout line %d: %.100s",
-                    line_count,
-                    decoded.strip(),
+        async def _watch_stall() -> None:
+            notified = False
+            while True:
+                await asyncio.sleep(1.0)
+                idle = asyncio.get_running_loop().time() - last_activity[0]
+                threshold = (
+                    _STALL_NOTICE_SECONDS if not notified
+                    else _STALL_NOTICE_SECONDS + _STALL_REPEAT_SECONDS
                 )
+                if idle < threshold:
+                    continue
+                notified = True
+                last_activity[0] = asyncio.get_running_loop().time()
+                logger.info(
+                    "Claude CLI: no output for %.0fs (pid=%s) — likely retrying upstream",
+                    idle, getattr(self._process, "pid", "?"),
+                )
+                try:
+                    on_thinking(
+                        f"[{int(idle)} másodperce nincs válasz az API-tól — "
+                        f"valószínűleg újrapróbálkozik. Még várok.]"
+                    )
+                except Exception:
+                    pass
 
-            if on_delta is not None or on_thinking is not None:
-                self._maybe_emit_delta(decoded, on_delta, on_thinking)
+        if on_thinking is not None and _STALL_NOTICE_SECONDS > 0:
+            watchdog = asyncio.create_task(_watch_stall())
 
-            event = parse_line(decoded)
-            if event:
-                events.append(event)
-                if event.is_complete:
-                    return events
+        try:
+            while True:
+                line = await self._process.stdout.readline()
+                last_activity[0] = asyncio.get_running_loop().time()
+                if not line:
+                    logger.info("Claude CLI stdout EOF after %d lines", line_count)
+                    break
+
+                line_count += 1
+                decoded = line.decode("utf-8", errors="replace")
+
+                if line_count <= 3:
+                    logger.info(
+                        "Claude CLI stdout line %d: %.100s",
+                        line_count,
+                        decoded.strip(),
+                    )
+
+                if on_delta is not None or on_thinking is not None:
+                    self._maybe_emit_delta(decoded, on_delta, on_thinking)
+
+                event = parse_line(decoded)
+                if event:
+                    events.append(event)
+                    if event.is_complete:
+                        return events
+        finally:
+            if watchdog is not None:
+                watchdog.cancel()
 
         # Process exited without a RESULT event -- check for errors.
         if self._process.returncode is None:
@@ -594,6 +754,30 @@ class ClaudeCliRunner:
                 "args": [reminder_script],
                 "env": reminder_env,
             }
+        # Delegálás: aszinkron kiszervezés kanban-workernek, az eredmény visszaírásával
+        # ABBA a beszélgetésbe, amelyikben kiadták. Ugyanaz a minta, mint az
+        # emlékeztetőnél: az APOLLO_THREAD_ID hordozza a visszacsatolás címzését,
+        # a profilt a fenris a szálból vezeti le. Opt-in: HERMES_DELEGATE_MCP.
+        delegate_script = os.environ.get("HERMES_DELEGATE_MCP")
+        if delegate_script and Path(delegate_script).is_file():
+            delegate_env = {
+                "APOLLO_API_BASE": os.environ.get("APOLLO_API_BASE", "http://localhost:8001"),
+                "APOLLO_NOTIFY_TOKEN_PATH": os.environ.get(
+                    "APOLLO_NOTIFY_TOKEN_PATH",
+                    str(Path.home() / ".hermes" / "apollo_notify_token.txt"),
+                ),
+            }
+            if self.apollo_session_id:
+                delegate_env["APOLLO_THREAD_ID"] = str(self.apollo_session_id)
+            mcp_servers["delegation"] = {
+                "command": sys.executable,
+                "args": [delegate_script],
+                "env": delegate_env,
+            }
+            # Jelzés a hermes-tools moatnak, hogy VAN delegálási út: ilyenkor a
+            # kanban_create nem adhat ki ügynök-munkát (az eredménye elveszne),
+            # csak emberi teendőt. Lásd tools/kanban_tools.py::_handle_create.
+            env["APOLLO_DELEGATION_ACTIVE"] = "1"
         atl = (os.environ.get("HERMES_ATLASSIAN_MCP") or "").strip()
         if atl:
             url = atl if atl.lower().startswith("http") else "https://mcp.atlassian.com/v1/mcp/authv2"

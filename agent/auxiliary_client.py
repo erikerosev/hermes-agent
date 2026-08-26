@@ -108,7 +108,7 @@ from agent.credential_pool import load_pool
 from agent.model_metadata import MINIMUM_CONTEXT_LENGTH, get_model_context_length
 from hermes_cli.config import get_hermes_home
 from hermes_constants import OPENROUTER_BASE_URL
-from utils import base_url_host_matches, base_url_hostname, env_float, model_forces_max_completion_tokens, normalize_proxy_env_vars
+from utils import base_url_host_matches, base_url_hostname, env_float, env_int, model_forces_max_completion_tokens, normalize_proxy_env_vars
 
 logger = logging.getLogger(__name__)
 
@@ -2967,6 +2967,49 @@ def _get_provider_chain() -> List[tuple]:
 _AUX_UNHEALTHY_TTL_SECONDS = 600  # 10 minutes
 _aux_unhealthy_until: Dict[str, float] = {}
 _aux_unhealthy_logged_at: Dict[str, float] = {}
+_aux_unhealthy_reason: Dict[str, str] = {}
+
+# ── Repeated-timeout circuit breaker ───────────────────────────────────────
+#
+# The payment-error cache above only opens on 402. A provider that *hangs*
+# was never tripped, so a hung endpoint kept getting re-attempted by every
+# new aux call. Observed on 2026-08-24: an upstream 529 wave made the local
+# aux endpoint burn its full 120s budget; the naplo side-task then re-fired
+# on each session-end (10:04, 10:06, 10:08, 10:11, 10:14) and every firing
+# paid another full 120s, spawned another CLI process, hit the aux
+# concurrency cap, 429'd, fell back, and queued on the turn lease. Four
+# rounds in ten minutes, all doomed, all competing with the user's own turn.
+#
+# A full-budget timeout is strong evidence the endpoint is unwell, but a
+# single one can be a blip — so the breaker opens only after
+# ``_AUX_TIMEOUT_BREAKER_THRESHOLD`` *consecutive* timeouts, and any success
+# resets the count. The TTL is deliberately much shorter than the payment
+# TTL: a hung endpoint usually recovers in minutes (the 529 wave above
+# cleared in ~18), whereas an empty account does not.
+# Tasks for which a full-budget timeout must NOT be retried on the same
+# provider. The retry costs another entire ``timeout`` window at poor odds;
+# what differs between tasks is who pays for it.
+#
+#   compression — the user pays: they cannot continue an oversized session
+#                 until it compacts (issue #54465, the original carve-out).
+#   naplo       — nobody is waiting, which is worse in a different way: the
+#                 stall is invisible, so it just burns a CLI process, an aux
+#                 concurrency slot and a turn lease while the user's own turn
+#                 competes for them (observed 2026-08-24).
+#
+# Deliberately NOT every task: MoA reference advisors pin a *specific* model,
+# so "fall back to another provider" is not a recovery for them — losing the
+# retry loses the advisor. Extend via HERMES_AUX_TIMEOUT_NO_RETRY_TASKS
+# (comma-separated) rather than by widening this default.
+_TIMEOUT_NO_SAME_PROVIDER_RETRY = frozenset(
+    t.strip() for t in os.environ.get(
+        "HERMES_AUX_TIMEOUT_NO_RETRY_TASKS", "compression,naplo"
+    ).split(",") if t.strip()
+)
+
+_AUX_TIMEOUT_BREAKER_THRESHOLD = env_int("HERMES_AUX_TIMEOUT_BREAKER", 2)
+_AUX_TIMEOUT_BREAKER_TTL_SECONDS = env_int("HERMES_AUX_TIMEOUT_BREAKER_TTL", 120)
+_aux_consecutive_timeouts: Dict[str, int] = {}
 
 # Map provider names that show up in resolved_provider / explicit-config
 # back to the chain labels used by _get_provider_chain(). Keep in sync
@@ -2993,23 +3036,63 @@ def _normalize_chain_label(provider: str) -> str:
     return _AUX_UNHEALTHY_LABEL_ALIASES.get(p, p)
 
 
-def _mark_provider_unhealthy(provider: str, ttl: Optional[float] = None) -> None:
-    """Mark ``provider`` as recently-402'd, hidden from chain iteration
-    until the TTL expires. Called from the payment-fallback branches in
-    ``call_llm`` and ``acall_llm`` after a confirmed payment error.
+def _mark_provider_unhealthy(
+    provider: str,
+    ttl: Optional[float] = None,
+    reason: str = "payment / credit error",
+) -> None:
+    """Mark ``provider`` as unhealthy, hidden from chain iteration until the
+    TTL expires. Called from the payment-fallback branches in ``call_llm`` and
+    ``acall_llm`` after a confirmed payment error, and from the repeated-
+    timeout breaker below.
     """
     label = _normalize_chain_label(provider)
     if not label:
         return
     expires_at = time.time() + (ttl if ttl is not None else _AUX_UNHEALTHY_TTL_SECONDS)
     _aux_unhealthy_until[label] = expires_at
+    _aux_unhealthy_reason[label] = reason
     logger.warning(
-        "Auxiliary: marking %s unhealthy for %ds (payment / credit error). "
+        "Auxiliary: marking %s unhealthy for %ds (%s). "
         "Subsequent auxiliary calls will skip it until %s.",
         label,
         int(ttl if ttl is not None else _AUX_UNHEALTHY_TTL_SECONDS),
+        reason,
         time.strftime("%H:%M:%S", time.localtime(expires_at)),
     )
+
+
+def _note_provider_timeout(provider: str, task: Optional[str] = None) -> None:
+    """Record a full-budget timeout against ``provider`` and open the circuit
+    breaker once they stop looking like a blip.
+
+    Only *consecutive* timeouts count — ``_note_provider_success`` clears the
+    tally — so a provider that answers between stalls never trips.
+    """
+    label = _normalize_chain_label(provider)
+    if not label:
+        return
+    count = _aux_consecutive_timeouts.get(label, 0) + 1
+    _aux_consecutive_timeouts[label] = count
+    if count < _AUX_TIMEOUT_BREAKER_THRESHOLD:
+        logger.info(
+            "Auxiliary %s: %s timed out (%d/%d before the circuit breaker opens)",
+            task or "call", label, count, _AUX_TIMEOUT_BREAKER_THRESHOLD,
+        )
+        return
+    _aux_consecutive_timeouts[label] = 0
+    _mark_provider_unhealthy(
+        label,
+        ttl=_AUX_TIMEOUT_BREAKER_TTL_SECONDS,
+        reason=f"{count} consecutive timeouts",
+    )
+
+
+def _note_provider_success(provider: str) -> None:
+    """Clear the consecutive-timeout tally for ``provider`` after any success."""
+    label = _normalize_chain_label(provider)
+    if label:
+        _aux_consecutive_timeouts.pop(label, None)
 
 
 def _is_provider_unhealthy(label: str) -> bool:
@@ -3039,8 +3122,10 @@ def _log_skip_unhealthy(label: str, task: Optional[str] = None) -> None:
         _aux_unhealthy_logged_at[label] = now
         expires_at = _aux_unhealthy_until.get(label, now)
         logger.info(
-            "Auxiliary %s: skipping %s (recently returned payment error, retry in %ds)",
-            task or "call", label, max(0, int(expires_at - now)),
+            "Auxiliary %s: skipping %s (%s, retry in %ds)",
+            task or "call", label,
+            _aux_unhealthy_reason.get(label, "recently returned payment error"),
+            max(0, int(expires_at - now)),
         )
 
 
@@ -3049,6 +3134,8 @@ def _reset_aux_unhealthy_cache() -> None:
     user trigger (e.g. ``hermes config aux reset``)."""
     _aux_unhealthy_until.clear()
     _aux_unhealthy_logged_at.clear()
+    _aux_unhealthy_reason.clear()
+    _aux_consecutive_timeouts.clear()
 
 
 def _is_payment_error(exc: Exception) -> bool:
@@ -7135,25 +7222,27 @@ def call_llm(
         # ``first_err`` and the existing fallback handling unchanged. Unified home
         # for the transient retry every auxiliary task shares. (PR #16587)
         try:
-            return _validate_llm_response(
+            _ok = _validate_llm_response(
                 client.chat.completions.create(**kwargs), task,
                 provider=resolved_provider, base_url=_base_info)
+            _note_provider_success(resolved_provider)
+            return _ok
         except Exception as transient_err:
+            if _is_timeout_error(transient_err):
+                _note_provider_timeout(resolved_provider, task)
             if not _is_transient_transport_error(transient_err):
                 raise
-            # Compression is on the critical preflight path: a user cannot
-            # continue or resume an oversized session until it compacts. A
-            # same-provider retry on a timeout means another full ``timeout``-
-            # long wall-clock block before the except-chain below can fall
-            # back — doubling the user-visible stall (issue #54465). Skip the
-            # same-provider retry for compression on a full-budget timeout and
-            # fall straight through to provider/model fallback; fast blips (a
-            # streaming-close or a 5xx) still retry, since those are cheap.
-            if task == "compression" and _is_timeout_error(transient_err):
+            # A full-budget timeout already burned the whole ``timeout``
+            # window, so for the tasks in _TIMEOUT_NO_SAME_PROVIDER_RETRY a
+            # same-provider retry just buys another full stall at poor odds
+            # while the fallback chain sits right there. Fast blips (a
+            # streaming-close, a 5xx) are cheap and still retry for every
+            # task — that is the case this retry loop was built for.
+            if task in _TIMEOUT_NO_SAME_PROVIDER_RETRY and _is_timeout_error(transient_err):
                 logger.info(
-                    "Auxiliary compression: timeout on the critical path; "
-                    "skipping same-provider retry and falling back: %s",
-                    transient_err,
+                    "Auxiliary %s: full-budget timeout; skipping same-provider "
+                    "retry and falling back: %s",
+                    task or "call", transient_err,
                 )
                 raise
             _max_transient_retries = _transient_retry_count()
@@ -7168,9 +7257,13 @@ def call_llm(
                 )
                 time.sleep(_backoff)
                 try:
-                    return _validate_llm_response(
+                    _ok = _validate_llm_response(
                         client.chat.completions.create(**kwargs), task)
+                    _note_provider_success(resolved_provider)
+                    return _ok
                 except Exception as retry_transient:
+                    if _is_timeout_error(retry_transient):
+                        _note_provider_timeout(resolved_provider, task)
                     if not _is_transient_transport_error(retry_transient):
                         raise
                     _last_transient = retry_transient
@@ -7721,20 +7814,23 @@ async def async_call_llm(
         # before the except-chain escalates to fallback — see call_llm()
         # for the rationale. (PR #16587)
         try:
-            return _validate_llm_response(
+            _ok = _validate_llm_response(
                 await client.chat.completions.create(**kwargs), task,
                 provider=resolved_provider, base_url=_client_base)
+            _note_provider_success(resolved_provider)
+            return _ok
         except Exception as transient_err:
+            if _is_timeout_error(transient_err):
+                _note_provider_timeout(resolved_provider, task)
             if not _is_transient_transport_error(transient_err):
                 raise
-            # See call_llm(): compression is on the critical preflight path,
-            # so skip the same-provider retry on a full-budget timeout and
-            # fall straight through to fallback (issue #54465).
-            if task == "compression" and _is_timeout_error(transient_err):
+            # See call_llm(): for these tasks a full-budget timeout is never
+            # worth a same-provider retry.
+            if task in _TIMEOUT_NO_SAME_PROVIDER_RETRY and _is_timeout_error(transient_err):
                 logger.info(
-                    "Auxiliary compression (async): timeout on the critical "
-                    "path; skipping same-provider retry and falling back: %s",
-                    transient_err,
+                    "Auxiliary %s (async): full-budget timeout; skipping "
+                    "same-provider retry and falling back: %s",
+                    task or "call", transient_err,
                 )
                 raise
             logger.info(
@@ -7742,8 +7838,10 @@ async def async_call_llm(
                 "once on the same provider before fallback: %s",
                 task or "call", transient_err,
             )
-            return _validate_llm_response(
+            _ok = _validate_llm_response(
                 await client.chat.completions.create(**kwargs), task)
+            _note_provider_success(resolved_provider)
+            return _ok
     except Exception as first_err:
         if "temperature" in kwargs and _is_unsupported_temperature_error(first_err):
             retry_kwargs = dict(kwargs)
