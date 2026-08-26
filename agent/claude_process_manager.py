@@ -102,9 +102,16 @@ def _msg_text(content) -> str:
     return "" if content is None else str(content)
 
 
-def _render_history(history) -> str:
+def _render_history(history, session: str | None = None) -> str:
     """A szál előzményét (prior user/assistant turn-ök) egy priming-szöveggé alakítja,
-    amit egy FRISS processz első üzeneteként küldünk, hogy legyen kontextusa."""
+    amit egy FRISS processz első üzeneteként küldünk, hogy legyen kontextusa.
+
+    A `session` (= Apollo-thread id) a GÖRDÜLŐ ÖSSZEFOGLALÓHOZ kell: ha az előzmény nem
+    fér az ablakba, a kieső elejét nem némán dobjuk el, hanem egy korábban elkészült
+    összefoglaló képviseli (lásd agent/thread_summary.py). Ha nincs kész összefoglaló,
+    a viselkedés VÁLTOZATLAN, és a frissítés háttérben indul a következő respawnra —
+    a user-turn sosem vár rá.
+    """
     if not history:
         return ""
     lines = []
@@ -124,19 +131,54 @@ def _render_history(history) -> str:
     # Recent-truncation: csak az utolsó _MAX_PRIME_CHARS-nyi előzményt primingoljuk
     # (a legújabb turn-öket tartjuk meg) → a live processz kontextusa indulásból
     # bounded, sosem csordul túl. A teljes history a state.db-ben marad (nem vész el),
-    # és a tartós tények a kozos-memóriában. Régebbi nyers turn-ök elöl esnek ki.
-    body = "\n".join(lines)
-    truncated = False
-    if len(body) > _MAX_PRIME_CHARS:
+    # és a tartós tények a kozos-memóriában. A kieső elejét a gördülő összefoglaló
+    # képviseli — ÜZENET-határon vágunk (nem karakteren), hogy pontosan tudjuk, mit
+    # kell az összefoglalónak lefednie, és ne fűrészeljünk félbe egy fordulót.
+    cut = 0
+    running = 0
+    for i in range(len(lines) - 1, -1, -1):
+        running += len(lines[i]) + 1
+        if running > _MAX_PRIME_CHARS:
+            cut = i + 1
+            break
+
+    summary = ""
+    try:
+        from agent import thread_summary
+
+        summary, covered = thread_summary.get(session)
+        if cut and thread_summary.should_refresh(cut, covered):
+            # Csak a MÉG nem lefedett szakaszt küldjük — az összefoglaló inkrementális,
+            # így a hívás mérete nem nő együtt a szállal.
+            dropped = "\n".join(lines[covered:cut]) if covered < cut else ""
+            thread_summary.maybe_refresh(session, dropped, cut, summary)
+        # A nyers rész PONTOSAN ott folytatódjon, ahol az összefoglaló véget ér — se
+        # átfedés, se lyuk. Ha az összefoglaló elavult (kevesebbet fed le, mint ami
+        # kiesne), a köztes sorok NYERSEN mennek: inkább lépjük túl kicsit az ablakot,
+        # mint hogy egy szakasz csendben eltűnjön a kettő között. (Ezt a rést egy teszt
+        # találta meg: covered=30, cut=32 mellett a 30-31. üzenet sehol nem szerepelt.)
+        if summary:
+            cut = min(covered, len(lines)) if covered else cut
+    except Exception:
+        summary = ""  # fail-safe: összefoglaló nélkül a korábbi viselkedés
+
+    kept = lines[cut:] if cut < len(lines) else lines[-1:]
+    body = "\n".join(kept)
+    # Biztonsági korlát: ha az összefoglaló-frissítés TARTÓSAN bukik (LLM elérhetetlen),
+    # a fenti „inkább nyersen" szabály felfújná a primingot. Kétszeres ablaknál vágunk —
+    # ilyenkor visszaesünk a régi viselkedésre (lyukkal), de nem csordulunk túl.
+    if len(body) > _MAX_PRIME_CHARS * 2:
         body = body[-_MAX_PRIME_CHARS:]
-        truncated = True
     head = (
         "[A szal eddigi beszelgetese ebben a fonalban — TE vagy az asszisztens, "
         "folytasd termeszetesen, mintha vegig te valaszoltal volna; ne ismeteld vissza, "
         "csak emlekezz ra. Az aktualis uj uzenet a vegen jon."
         + (" (A legregebbi reszek lemaradtak — a tartos tenyeket a memoria orzi.)]"
-           if truncated else "]")
+           if cut and not summary else "]")
     )
+    if summary and cut:
+        head += ("\n\n[A szal KORABBI szakaszanak osszefoglaloja (a nyers valtozat mar nem "
+                 "fer ide; ez is a TE emleked, ugyanugy tamaszkodj ra):]\n" + summary)
     return head + "\n\n" + body + "\n\n[Aktualis uj uzenet:]\n"
 
 
@@ -419,7 +461,7 @@ class ClaudeProcessManager:
                 # a prompt elé fűzzük, hogy legyen kontextusa (restart/respawn-biztos).
                 # WARM processz: csak az új üzenet — a kontextus már a live processzben van.
                 if not p.primed:
-                    preamble = _render_history(history)
+                    preamble = _render_history(history, session_id)
                     p.primed = True
                     if preamble:
                         return preamble + prompt

@@ -383,6 +383,23 @@ def _safe_session_filename_component(session_id: str) -> str:
     return f"{sanitized}_{digest}"
 
 
+
+def _aux_working_dir() -> str | None:
+    """Git-mentes, üres könyvtár a könnyű aux-hívásoknak (lásd a hívás helyén a
+    magyarázatot). Hiba esetén None → a hívó marad a korábbi working_dir-nél."""
+    try:
+        import pathlib
+        # NEM a ~/.hermes alá: az maga is git-repó (config/SOUL/skills verziózva), és a
+        # claude-cli a CWD git-státuszát a system-promptjába teszi — mérve ettől hitte
+        # magát „a Hermes projekten dolgozó" munkamenetnek. Git-mentes hely kell.
+        d = pathlib.Path(os.environ.get("HERMES_AUX_WORKDIR")
+                         or (pathlib.Path.home() / ".cache" / "apollo-aux-workdir"))
+        d.mkdir(parents=True, exist_ok=True)
+        return str(d)
+    except Exception:
+        return None
+
+
 class _StreamErrorEvent(Exception):
     """Synthesized provider error surfaced from a Responses ``error`` SSE frame.
 
@@ -6163,6 +6180,20 @@ class AIAgent:
         auto-compress abort.  Auto-compress callers use the default
         ``force=False``.
         """
+        # KÍVÜLRŐL RÖGZÍTETT (stateful X-Hermes-Session-Id) session: a KLIENS birtokolja
+        # a session_id-t és minden turnben ugyanazt küldi. A tömörítés viszont rotálja az
+        # id-t és kettévágja a SQLite-sessiont — az új turnök egy árva id alá kerülnek,
+        # amit a kliens soha nem olvas vissza, tehát a szál kontextusa megfagy az első
+        # küszöb feletti turnnél. Minden hívót fed (preflight + hiba-helyreállítás).
+        # Az élő kontextust a claude-cli úton a recycle + MAX_PRIME_CHARS + a gördülő
+        # összefoglaló tartja korlátok között; a teljes átirat a rögzített id alatt marad.
+        if getattr(self, "_external_session", False):
+            _sp = getattr(self, "_cached_system_prompt", None)
+            if _sp is None:
+                _sp = self._build_system_prompt(system_message)
+                self._cached_system_prompt = _sp
+            return messages, _sp
+
         from agent.conversation_compression import compress_context
         return compress_context(
             self, messages, system_message,
@@ -6499,6 +6530,14 @@ class AIAgent:
         # Ez orvosolja az aux-önrekurziót: az aux-hívás már nem teljes agent-turn.
         if bool(getattr(self, "_aux_lightweight", False)):
             _aux_model = getattr(self, "_aux_model", None) or "haiku"
+            # SEMLEGES MUNKAKÖNYVTÁR. A claude-cli a CWD projekt-kontextusát (git-státusz,
+            # CLAUDE.md) a system-promptjába teszi — a gateway pedig a hermes-agent repóból
+            # indul. Emiatt az aux-hívások „kódolási munkamenetnek" hitték magukat, és a
+            # kért JSON helyett elhárító prózát adtak („ez nem az én feladatköröm, itt a
+            # hermes-agent repóban dolgozunk"); ez volt a kozos-memória konszolidációjának
+            # egyik bukó-oka. Egy git-mentes, üres dir ezt megszünteti — a side-tasknak
+            # amúgy sincs szüksége a repóra (nincs MCP, nincs tool).
+            working_dir = _aux_working_dir() or working_dir
             api_kwargs = transport.build_kwargs(
                 model=_aux_model,
                 messages=messages + [{"role": "user", "content": user_message}],
@@ -6749,7 +6788,9 @@ class AIAgent:
                 _resume_sid = _claude_sid
             else:
                 from agent.claude_process_manager import _render_history
-                _preamble = _render_history(messages)
+                # session-kulccsal: a stateless út is a gördülő összefoglalót kapja
+                # (nem csak a persistent pool), ha a szál kinőtte a priming-ablakot.
+                _preamble = _render_history(messages, self.session_id)
                 _stateless_prompt = (_preamble + api_kwargs["prompt"]) if _preamble else api_kwargs["prompt"]
                 _resume_sid = None
             events = asyncio.run(runner.run(

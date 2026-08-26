@@ -4879,6 +4879,21 @@ class APIServerAdapter(BasePlatformAdapter):
                     # (429 "Too many concurrent runs"). Lásd run_agent.py
                     # "Könnyű aux-út" blokk.
                     self._apply_aux_sentinel(agent, aux_lightweight, aux_model)
+                    if pinned_session:
+                        # A KLIENS birtokolja a session_id-t (X-Hermes-Session-Id) és minden
+                        # turnben ugyanazt küldi. A gateway-tömörítés viszont ROTÁLJA a
+                        # session_id-t: az új turn egy árva id alá kerül, amit a kliens soha
+                        # nem olvas vissza → a szál kontextusa megfagy, az átirat lyukassá
+                        # válik. (Ezt a 72d0c8c991 már megoldotta 2026-07-03-án; a v2026-os
+                        # rebase elvesztette a beállítást — a `pinned_session` paraméter
+                        # átjött, de HOLTAN, sehol nem használva —, ezért a tünet visszatért:
+                        # a Peak szálban 1682 üzenetből 1352 lett `compacted`, 34 napos lyukkal
+                        # az aktív készlet közepén.) A claude-cli meleg-processz kontextusát
+                        # a recycle + MAX_PRIME_CHARS + a gördülő összefoglaló korlátozza
+                        # (claude_process_manager, thread_summary), tehát nincs szükség a
+                        # gateway-tömörítésre. A stateless/CLI/messaging út változatlan.
+                        agent._external_session = True
+                        agent.compression_enabled = False
                     effective_task_id = session_id or str(uuid.uuid4())
                     result = agent.run_conversation(
                         user_message=user_message,
