@@ -1750,16 +1750,33 @@ KANBAN_ATTACHMENTS_SCHEMA = {
     },
 }
 
+# A leírás a DÖNTÉS előtt látszik, a guard csak a hívás UTÁN szól — ezért a korlátnak
+# itt kell lennie, nem csak a hibaüzenetben. Delegálási úttal rendelkező (Apollo)
+# kontextusban a fenti általános leírás félrevezetett: „decompose work into child tasks
+# with specific assignees" pontosan azt tanácsolja, amit a _handle_create guardja
+# visszautasít. A modell így a leírást követte, hibát kapott, majd korrigált — kívülről
+# ez „inkonzisztens tool-használatnak" látszott, holott hiányzó információ volt.
+_CREATE_DESC = (
+    "Create a new kanban task, optionally as a child of the current "
+    "one (pass the current task id in ``parents``). Used by "
+    "orchestrator workers to fan out — decompose work into child "
+    "tasks with specific assignees, link them into a pipeline, "
+    "then complete your own task. The dispatcher picks up the new "
+    "tasks on its next tick and spawns the assigned profiles."
+)
+if os.environ.get("APOLLO_DELEGATION_ACTIVE"):
+    _CREATE_DESC += (
+        " IMPORTANT — in THIS context a delegation path exists, so this tool is "
+        "for HUMAN to-dos only (e.g. ``assignee='erik'``). To hand work to an "
+        "executor agent (engineer, devops, product, …) use ``delegate_task`` "
+        "instead: only that binds the result back to this conversation, whereas "
+        "agent work started here would finish silently and reach nobody. "
+        "Passing an executor profile as ``assignee`` is rejected here."
+    )
+
 KANBAN_CREATE_SCHEMA = {
     "name": "kanban_create",
-    "description": (
-        "Create a new kanban task, optionally as a child of the current "
-        "one (pass the current task id in ``parents``). Used by "
-        "orchestrator workers to fan out — decompose work into child "
-        "tasks with specific assignees, link them into a pipeline, "
-        "then complete your own task. The dispatcher picks up the new "
-        "tasks on its next tick and spawns the assigned profiles."
-    ),
+    "description": _CREATE_DESC,
     "parameters": {
         "type": "object",
         "properties": {
