@@ -144,6 +144,36 @@ def _clip(text: str, limit: int) -> str:
     return head.rsplit(" ", 1)[0].rstrip() if " " in head else head.rstrip()
 
 
+# Csevegő válasz gyanújelei. Az aux-modell időnként VÁLASZOL a beszélgetésre ahelyett,
+# hogy összefoglalná (ugyanaz a hibacsalád, mint a kozos-konszolidáció „csevegett JSON
+# helyett" esete). Élesben ez rombolt: a Peak-szál 2498 üzenetét egy 131 karakteres
+# „Vettem — ez most a szétválasztás témája, kezdjük…" mondat képviselte, mert az egyetlen
+# ellenőrzés egy 80 karakteres alsó korlát volt, és a rossz válasz FELÜLÍRTA a korábbi jót.
+_CHATTY_STARTS = (
+    "vettem", "rendben", "oké", "ok,", "értem", "persze", "köszi", "köszönöm",
+    "szia", "hello", "igen,", "nem,", "jó,", "sajnálom", "elnézést",
+)
+
+
+def _looks_like_summary(text: str, prev: str) -> tuple[bool, str]:
+    """(elfogadható-e, indok). Konzervatív: ha bizonytalan, INKÁBB megtartjuk a régit.
+
+    Az összefoglaló KUMULATÍV — a prompt kifejezetten összeolvasztást kér —, ezért egy
+    a korábbinál drasztikusan rövidebb eredmény bizonyítottan hibás, nem tömörebb."""
+    t = (text or "").strip()
+    if len(t) < 400:
+        return False, f"túl rövid ({len(t)} kar)"
+    low = t.lower().lstrip("*#-– ")
+    if low.startswith(_CHATTY_STARTS):
+        return False, "csevegő megszólítással kezd (nem összefoglaló)"
+    if "?" in t[:200]:
+        return False, "kérdéssel indít (válasz, nem összefoglaló)"
+    if prev and len(t) < len(prev) * 0.5:
+        # Kumulatív invariáns: a korábbit be kell olvasztania, tehát nem zsugorodhat felére.
+        return False, f"a korábbi felénél rövidebb ({len(t)} < {len(prev)})"
+    return True, ""
+
+
 def _refresh(session: str, dropped_text: str, covered: int, prev: str) -> None:
     try:
         # DARABOLVA, ha a lefedendő szakasz nem fér egy hívásba. A rendes működésben a
@@ -161,16 +191,29 @@ def _refresh(session: str, dropped_text: str, covered: int, prev: str) -> None:
                 prompt += "\n\n--- KORÁBBI ÖSSZEFOGLALÓ ---\n" + out
             prompt += "\n\n--- A BESZÉLGETÉS KORÁBBI SZAKASZA ---\n" + body
             got = (_aux_complete(prompt) or "").strip()
-            if len(got) < 80:
-                logger.warning("thread_summary: túl rövid válasz a(z) %d/%d darabnál (%d kar)",
-                               n, len(chunks), len(got))
+            ok, why = _looks_like_summary(got, out)
+            if not ok:
+                # NEM írjuk felül a meglévőt egy gyanús válasszal — inkább marad a régi.
+                logger.warning("thread_summary: %s — %d/%d darab elvetve: %s",
+                               session, n, len(chunks), why)
                 continue
             out = _clip(got, _MAX_SUMMARY_CHARS)
             if len(chunks) > 1:
                 logger.info("thread_summary: %s — %d/%d darab kész (%d kar)",
                             session, n, len(chunks), len(out))
-        if not out or len(out) < 80:
-            logger.warning("thread_summary: nem született használható összefoglaló")
+        if not out or out == prev:
+            logger.warning("thread_summary: %s — nem született új összefoglaló, a régi marad",
+                           session)
+            return
+        ok, why = _looks_like_summary(out, prev)
+        if not ok:
+            logger.warning("thread_summary: %s — a végeredmény elvetve (%s), a régi marad",
+                           session, why)
+            try:
+                from hermes_gatelog import log as _gl
+                _gl("thread_summary", "deny", why, session=session, chars=len(out or ""))
+            except Exception:
+                pass
             return
         _store(session, out, covered)
         logger.info("thread_summary: %s frissítve (%d sort fed le, %d kar, %d darab)",

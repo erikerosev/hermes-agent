@@ -1103,6 +1103,13 @@ def _handle_create(args: dict, **kw) -> str:
         except Exception:
             _pe = None
         if _pe is not None and _pe(str(assignee).strip()):
+            try:
+                from hermes_gatelog import log as _gl
+                _gl("kanban_create_apollo", "deny",
+                    "ügynök-profil a kanban_create-en (delegate_task kell)",
+                    assignee=str(assignee).strip())
+            except Exception:
+                pass
             return tool_error(
                 f"'{assignee}' végrehajtó ügynök — ezt a `delegate_task` toollal "
                 "add ki, ne a kanban_create-tel. Csak a delegate_task köti az "

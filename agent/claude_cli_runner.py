@@ -700,6 +700,13 @@ class ClaudeCliRunner:
             kozos_env = {"KOZOS_SERVICE_URL": os.environ.get("KOZOS_SERVICE_URL", "http://localhost:8765")}
             if env.get("HERMES_PROFILE"):
                 kozos_env["HERMES_PROFILE"] = env["HERMES_PROFILE"]
+            # Beszélgetés-keresés (conversation_search / _read): a fenris thread-tárát
+            # kérdezi. Az APOLLO_THREAD_ID-vel hagyja ki az AKTUÁLIS szálat — annak a
+            # tartalma amúgy is a kontextusban van, felesleges lenne visszakeresni.
+            kozos_env["APOLLO_API_BASE"] = os.environ.get(
+                "APOLLO_API_BASE", "http://localhost:8001")
+            if self.apollo_session_id:
+                kozos_env["APOLLO_THREAD_ID"] = str(self.apollo_session_id)
             mcp_servers["kozos-memory"] = {
                 "command": sys.executable,
                 "args": [kozos_script],
