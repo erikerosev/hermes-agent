@@ -779,6 +779,11 @@ class ClaudeCliRunner:
             # csak emberi teendőt. Lásd tools/kanban_tools.py::_handle_create.
             env["APOLLO_DELEGATION_ACTIVE"] = "1"
         atl = (os.environ.get("HERMES_ATLASSIAN_MCP") or "").strip()
+        # "0"/"off"/"false"/"no" = KI. Enélkül puszta truthiness dönt, és a "0"
+        # (nem üres string) bekapcsolva hagyná a szervert — csendben, mert a
+        # deklaráció sikerül, csak a hívások halnak meg később.
+        if atl.lower() in ("0", "off", "false", "no"):
+            atl = ""
         if atl:
             url = atl if atl.lower().startswith("http") else "https://mcp.atlassian.com/v1/mcp/authv2"
             mcp_servers["atlassian"] = {"type": "http", "url": url}
