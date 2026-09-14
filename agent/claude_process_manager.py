@@ -429,12 +429,20 @@ class ClaudeProcessManager:
             # KOSZOS processz (előző turn nem tiszta result-tal zárt → leszakadt maradék a
             # queue-ban) VAGY nem-üres queue → ÚJRA kell indítani, különben a következő turn a
             # leszakadt kimenetet olvasná (desync/replay). Ez a persistent egy-turn-eltolódás fixe.
-            _dirty = proc is not None and (proc.dirty or not proc._q.empty())
+            # A két ok NAGYON különbözik, ezért külön is mérjük:
+            #  * proc.dirty  → a forduló nem tiszta `result`-tal zárult (timeout/EOF/megszakítás)
+            #  * queue nem üres → a forduló rendben lezárt, de maradt utána kimenet a sorban
+            _dirty_flag = proc is not None and proc.dirty
+            _dirty_queue = proc is not None and not proc._q.empty()
+            _dirty = _dirty_flag or _dirty_queue
             recycle = proc is not None and proc.is_running() and (
                 proc.turn_count >= _RECYCLE_TURNS or _toggle_changed or _dirty)
             if recycle:
-                logger.info("persistent claude recycle (session=%s, turns=%s, toggle_changed=%s, dirty=%s)",
-                            key, proc.turn_count, _toggle_changed, _dirty)
+                logger.info(
+                    "persistent claude recycle (session=%s, turns=%s, toggle_changed=%s, "
+                    "dirty_flag=%s, dirty_queue=%s, qsize=%s)",
+                    key, proc.turn_count, _toggle_changed, _dirty_flag, _dirty_queue,
+                    proc._q.qsize())
             if proc is None or not proc.is_running() or recycle:
                 if proc is not None:
                     proc.kill()
