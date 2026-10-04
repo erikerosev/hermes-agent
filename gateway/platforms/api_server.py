@@ -79,6 +79,7 @@ _CAPABILITY_ENDPOINTS = (
     ("health", ("GET", "/health")), ("health_detailed", ("GET", "/health/detailed")),
     ("models", ("GET", "/v1/models")), ("model_options", ("GET", "/api/model/options")),
     ("chat_completions", ("POST", "/v1/chat/completions")),
+    ("clarify", ("POST", "/v1/clarify")),
     ("responses", ("POST", "/v1/responses")), ("runs", ("POST", "/v1/runs")),
     ("run_status", ("GET", "/v1/runs/{run_id}")),
     ("run_events", ("GET", "/v1/runs/{run_id}/events")),
@@ -1613,6 +1614,7 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             ("POST", "/api/sessions/{session_id}/chat/stream", self._handle_session_chat_stream),
             ("POST", "/api/sessions/{session_id}/model", self._handle_session_model_lock),
             ("POST", "/v1/chat/completions", self._handle_chat_completions),
+            ("POST", "/v1/clarify", self._handle_clarify),
             ("POST", "/v1/responses", self._handle_responses),
             ("GET", "/v1/responses/{response_id}", self._handle_get_response),
             ("DELETE", "/v1/responses/{response_id}", self._handle_delete_response),
@@ -2285,6 +2287,29 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         return web.json_response({"status": "ok", "platform": "hermes-agent", "version": _hermes_version()})
 
     @_require_auth
+    async def _handle_clarify(self, request: "web.Request") -> "web.Response":
+        """POST /v1/clarify — answer a pending ``clarify`` prompt.
+
+        Body: ``{"clarify_id": "<id from the hermes.clarify SSE event>",
+        "response": "<the user's answer>"}``. Unblocks the agent worker thread
+        that is waiting inside the ``clarify`` tool so it can continue on the
+        same (still-open) chat-completions SSE stream.
+        """
+        try:
+            body = await request.json()
+        except Exception:
+            return web.json_response({"error": "invalid JSON body"}, status=400)
+        clarify_id = str(body.get("clarify_id") or "").strip()
+        if not clarify_id:
+            return web.json_response({"error": "clarify_id is required"}, status=400)
+        response_text = body.get("response", "")
+        from tools.clarify_gateway import resolve_gateway_clarify
+        resolved = resolve_gateway_clarify(clarify_id, str(response_text))
+        if not resolved:
+            # Unknown id, already answered, or expired (timed out / session end).
+            return web.json_response({"resolved": False}, status=404)
+        return web.json_response({"resolved": True})
+
     async def _handle_health_detailed(self, request: "web.Request") -> "web.Response":
         """GET /health/detailed — gateway state, platforms, PID for dashboard probing (Bearer auth)."""
         from gateway.status import (

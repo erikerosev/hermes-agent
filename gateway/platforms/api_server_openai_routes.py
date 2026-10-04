@@ -700,11 +700,38 @@ class OpenAICompatRoutesMixin:
                 _stream_q.put_threadsafe(("__tool_progress__", {
                     "tool": function_name, "toolCallId": tool_call_id, "status": "completed"}))
 
+            # Clarify: when the agent calls the ``clarify`` tool, surface the question over SSE
+            # as an ``event: hermes.clarify`` frame and block the agent's worker thread until the
+            # client answers via ``POST /v1/clarify`` (-> ``resolve_gateway_clarify``). Mirrors the
+            # messaging-platform wiring in gateway/run.py, but the delivery channel is this SSE
+            # queue instead of an adapter's ``send_clarify``. Runs on the worker thread (sync).
+            def _clarify_cb(question: str, choices) -> str:
+                from tools import clarify_gateway as _clarify_mod
+                import uuid as _uuid
+                clarify_id = _uuid.uuid4().hex[:10]
+                _clarify_mod.register(
+                    clarify_id=clarify_id,
+                    session_key=session_id or completion_id,
+                    question=question,
+                    choices=list(choices) if choices else None,
+                )
+                _stream_q.put_threadsafe(("__clarify__", {
+                    "clarify_id": clarify_id,
+                    "question": question,
+                    "choices": list(choices) if choices else None,
+                }))
+                timeout = _clarify_mod.get_clarify_timeout()
+                response = _clarify_mod.wait_for_response(clarify_id, timeout=float(timeout))
+                if response is None or response == "":
+                    return f"[user did not respond within {int(timeout / 60)}m]"
+                return response
+
             # tool_progress_callback deliberately NOT wired: it would duplicate the structured
             # start/complete callbacks (which carry the tool_call id).
             agent_task, agent_ref = self._spawn_stream_agent(
                 _stream_q, tool_start_callback=_on_tool_start,
-                tool_complete_callback=_on_tool_complete, **run_kwargs)
+                tool_complete_callback=_on_tool_complete,
+                clarify_callback=_clarify_cb, **run_kwargs)
             # #13437 identity contract: an explicit-header client keeps addressing the id it
             # sent; the response echoes that stable id while reads/writes adopt the live tip,
             # so a rotation mid-turn (after these headers are prepared) never changes what the
@@ -844,6 +871,10 @@ class OpenAICompatRoutesMixin:
                     await response.write(_sse_frame(_chunk({"reasoning_content": delta[1]})))
                 elif isinstance(delta, tuple) and len(delta) == 2 and delta[0] == "__status__":
                     await response.write(_sse_frame(delta[1], event="hermes.status"))
+                elif isinstance(delta, tuple) and len(delta) == 2 and delta[0] == "__clarify__":
+                    # UI-only frame: the client renders the question (buttons for choices) and
+                    # answers on POST /v1/clarify; a strict OpenAI client just ignores it.
+                    await response.write(_sse_frame(delta[1], event="hermes.clarify"))
                 else:
                     await response.write(_sse_frame(_chunk({"content": delta})))
             # The agent can fail after the queue drains (task raises / result flagged failed or
