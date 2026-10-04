@@ -421,12 +421,88 @@ def _clip(text: str, n: int, ellipsis: str) -> str:
 
 # --- Core actions -------------------------------------------------------------
 
-def _create_skill(name: str, content: str, category: str = None) -> Dict[str, Any]:
+_OVERLAP_STOPWORDS = {
+    # HU
+    "hogy", "vagy", "egy", "ami", "amikor", "kell", "van", "nem", "ezt",
+    "skill", "betoltendo", "hasznald", "hasznalat", "alapjan", "eszkoz", "tool",
+    # EN
+    "the", "and", "for", "use", "used", "when", "with", "this", "that", "are",
+    "from", "into", "your", "you", "via", "using", "user", "data", "file", "files",
+}
+
+
+def _overlap_tokens(text: str) -> set:
+    """Accent-stripped, lowercased significant tokens (len>=4). Az ékezet-strip miatt az
+    'időjárás' és 'idojaras' egy tokenre esik, és a közös tulajdonnevek (máriapócs,
+    accuweather) / toolnevek is egyeznek HU/EN leírás között is."""
+    import unicodedata
+    folded = "".join(c for c in unicodedata.normalize("NFKD", text.lower())
+                     if not unicodedata.combining(c))
+    return {t for t in re.findall(r"[a-z0-9_]{4,}", folded) if t not in _OVERLAP_STOPWORDS}
+
+
+def _overlapping_skills(name: str, content: str, threshold: float = 0.30) -> List[Dict[str, Any]]:
+    """Meglévő skillek, amelyek NÉV+DESCRIPTION alapján erősen átfednek az újjal. A
+    duplikátum-gyártás (weather-check vs idojaras-ellenorzes) gyökér-oka az volt, hogy a
+    create CSAK pontos név-ütközést nézett. Determinisztikus, nincs LLM-költség."""
+    try:
+        _fm = re.search(r"\n---\s*\n", content[3:])
+        parsed = yaml.safe_load(content[3:_fm.start() + 3]) if _fm else {}
+        new_desc = str(parsed.get("description", ""))
+    except Exception:
+        new_desc = ""
+    new_tokens = _overlap_tokens(name + " " + new_desc)
+    if len(new_tokens) < 3:
+        return []
+    hits = []
+    for skill_md in _skills_dir().rglob("SKILL.md"):
+        if any(part.startswith(("_removed", ".archive")) for part in skill_md.parts):
+            continue
+        try:
+            raw = skill_md.read_text(encoding="utf-8")
+            _fm2 = re.search(r"\n---\s*\n", raw[3:])
+            meta = yaml.safe_load(raw[3:_fm2.start() + 3]) if _fm2 else {}
+            ex_name = str(meta.get("name", "")) or skill_md.parent.name
+            if ex_name == name:
+                continue
+            ex_tokens = _overlap_tokens(ex_name + " " + str(meta.get("description", "")))
+        except Exception:
+            continue
+        if not ex_tokens:
+            continue
+        shared = new_tokens & ex_tokens
+        score = len(shared) / min(len(new_tokens), len(ex_tokens))
+        if score >= threshold:
+            hits.append({"name": ex_name, "score": round(score, 2),
+                         "description": str(meta.get("description", ""))[:140],
+                         "shared": sorted(shared)[:8]})
+    hits.sort(key=lambda h: h["score"], reverse=True)
+    return hits[:4]
+
+
+def _create_skill(name: str, content: str, category: str = None,
+                  allow_overlap: bool = False) -> Dict[str, Any]:
     if err := (_validate_name(name) or _validate_category(category)
                or _validate_frontmatter(content, new_skill=True) or _validate_content_size(content)):
         return _err(err)
     if existing := _find_skill(name):
         return _err(f"A skill named '{name}' already exists at {existing['path']}.")
+    # Overlap gate: a puszta név-egyediség NEM elég — a capability-átfedés is duplikátum.
+    # Jóváhagyott staged-write replay-nél (_skill_gate_bypass) NEM tüzel: a user már OK-zta.
+    if not allow_overlap and not _skill_gate_bypass.get():
+        if overlaps := _overlapping_skills(name, content):
+            listing = "; ".join(f"'{o['name']}' (átfedés {o['score']}, "
+                                f"közös: {', '.join(o['shared'])})" for o in overlaps)
+            return {
+                "success": False,
+                "error": (
+                    f"Ez a skill valószínűleg ÁTFED meglévő skill(ek)et: {listing}. "
+                    "Egy képesség = egy skill. ELŐSZÖR nézd meg a fentit (skill_view), és ha a "
+                    "képesség ugyanaz, azt BŐVÍTSD (action='edit' vagy 'patch') új skill helyett. "
+                    "Ha tényleg különálló, hívd újra a create-et allow_overlap=true-val, és a "
+                    "description-ben mondd ki, miben más."),
+                "overlaps": overlaps,
+            }
     skill_dir = _resolve_skill_dir(name, category)
     from hermes_constants import mkdir_under_hermes_home
     mkdir_under_hermes_home(skill_dir)
@@ -711,7 +787,8 @@ def _act_patch(a):
 # action -> handler(args dict) returning a result dict, or a tool_error JSON string for
 # argument-shape errors. "edit" is a legacy alias for a full rewrite (not in the schema).
 _ACTION_HANDLERS = {
-    "create": lambda a: _create_skill(a["name"], a["content"], a["category"]),
+    "create": lambda a: _create_skill(a["name"], a["content"], a["category"],
+                                      allow_overlap=bool(a.get("allow_overlap"))),
     "edit": lambda a: _edit_skill(a["name"], a["content"]),
     "patch": _act_patch,
     "delete": lambda a: _delete_skill(a["name"], absorbed_into=a["absorbed_into"]),
@@ -884,6 +961,12 @@ SKILL_MANAGE_SCHEMA = {
                                     "description": "Full SKILL.md text (YAML frontmatter + markdown body)."},
                         "category": {"type": "string",
                                      "description": "Optional category subdir (e.g. 'devops')."},
+                        "allow_overlap": {"type": "boolean", "description": (
+                            "Default false. A create is soft-blocked if it strongly overlaps an "
+                            "existing skill (one capability = one skill). When blocked, FIRST "
+                            "inspect the named skill and prefer edit/patch. Set true ONLY if the "
+                            "new skill is genuinely distinct and the difference is explicit in "
+                            "its description.")},
                     }, ("content",)),
                     _op_schema("patch", {
                         "old_string": _OLD_STRING, "new_string": _NEW_STRING,

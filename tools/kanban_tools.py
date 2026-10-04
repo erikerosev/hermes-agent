@@ -743,6 +743,21 @@ def _handle_complete(args: dict, **kw) -> str:
                     f"{detail}; complete the parents first (done or archived)")
             _check(False, (task.last_failure_error if task else None) or
                    f"could not complete {tid} (unknown id, stale run, or already terminal)")
+        # Self-improvement: distill this completed task's durable lesson into the
+        # project naplo.md. Background + non-blocking — never delays the tool reply.
+        try:
+            import threading
+
+            def _bg_review() -> None:
+                try:
+                    from hermes_cli import kanban_review
+                    kanban_review.review_pending()
+                except Exception:
+                    pass
+
+            threading.Thread(target=_bg_review, name="kanban-review", daemon=True).start()
+        except Exception:
+            pass
         run = kb.latest_run(conn, tid)
         # Artifact staging is atomic with the completion write, so a worker that
         # read `kanban_attachments` before completing saw an empty list and has
@@ -1019,6 +1034,30 @@ def _handle_create(args: dict, **kw) -> str:
     assignee = args.get("assignee")
     _check(assignee, "assignee is required — name the profile that should execute this "
                      "task (the dispatcher will only spawn tasks with an assignee)")
+    # Apollo-kontextus (APOLLO_DELEGATION_ACTIVE): ott az ügynök-munkának kötődnie
+    # KELL a beszélgetéshez, különben az eredmény némán elveszik — 2026-08-25-én
+    # a t_08a4c656 rendben lefutott, és senki nem kapta meg, mert ez az út nem
+    # regisztrál visszacsatolást. Ezért itt csak EMBERI teendő hozható létre
+    # (nem indítható assignee); az ügynök-munka a `delegate_task` dolga.
+    if os.environ.get("APOLLO_DELEGATION_ACTIVE"):
+        try:
+            from hermes_cli.profiles import profile_exists as _pe
+        except Exception:
+            _pe = None
+        if _pe is not None and _pe(str(assignee).strip()):
+            try:
+                from hermes_gatelog import log as _gl
+                _gl("kanban_create_apollo", "deny",
+                    "ügynök-profil a kanban_create-en (delegate_task kell)",
+                    assignee=str(assignee).strip())
+            except Exception:
+                pass
+            return tool_error(
+                f"'{assignee}' végrehajtó ügynök — ezt a `delegate_task` toollal "
+                "add ki, ne a kanban_create-tel. Csak a delegate_task köti az "
+                "eredményt ehhez a beszélgetéshez; a kanban_create-tel kiadott "
+                "ügynök-munka eredménye némán elveszne. A kanban_create emberi "
+                "teendőre való.")
     # Workspace sharing is always explicit: omitted fields mean a fresh scratch workspace
     # even for a dispatcher-spawned creator (reusing the parent's path would let a child
     # mutate review evidence or race its checkout). Project identity is the one safe thing

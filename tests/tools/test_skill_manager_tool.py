@@ -551,7 +551,12 @@ class TestSkillManageDispatcher:
                  patch("tools.skill_usage.is_bundled",
                        side_effect=lambda skill_name: skill_name == "bundled"):
                 skill_manage(action="create", name="umbrella", content=VALID_SKILL_CONTENT)
-                skill_manage(action="create", name="bundled", content=VALID_SKILL_CONTENT)
+                # Distinct description on the second create: the Apollo overlap gate
+                # (one capability = one skill) soft-blocks a create whose name+description
+                # strongly overlaps an existing skill, and this test's setup used the SAME
+                # fixture for both. The assertion under test is the delete refusal, not the
+                # create, so a non-overlapping fixture keeps the intent intact.
+                skill_manage(action="create", name="bundled", content=VALID_SKILL_CONTENT_2)
                 raw = skill_manage(
                     action="delete",
                     name="bundled",

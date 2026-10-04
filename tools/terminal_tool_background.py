@@ -8,6 +8,7 @@ monkeypatch points authoritative.
 import json
 import logging
 import sys
+import time
 from typing import Any, List, Optional
 
 logger = logging.getLogger("tools.terminal_tool")
@@ -148,8 +149,10 @@ def spawn_background_process(
 ) -> str:
     """Spawn *command* as a tracked background process and return the JSON result.
 
-    Never inline-polls ``is_interrupted()``: the spawn detaches and returns
-    exit_code 0 immediately, so the stale-interrupt kill cannot occur here.
+    Never inline-polls ``is_interrupted()``: the spawn detaches, so the
+    stale-interrupt kill cannot occur here. A local spawn is given 0.25 s to
+    catch instant death — a command that already exited reports its REAL exit
+    code, and one still running reports ``exit_code: None`` (not a fake 0).
     """
     from tools.process_registry import process_registry
     from tools.terminal_tool import (
@@ -165,8 +168,42 @@ def spawn_background_process(
             effective_task_id=effective_task_id, task_id=task_id, session_key=session_key,
             effective_pty=effective_pty,
         )
-        result_data = {"output": "Background process started", "session_id": proc_session.id,
-                       "pid": proc_session.pid, "exit_code": 0, "error": None}
+        # Don't claim success blindly: a backgrounded command that instantly dies
+        # (typo, missing binary, import error) was reported as exit_code:0 /
+        # error:None, so the model believed a dead server was up. Give the local
+        # reader a beat to catch instant death, then report the REAL state.
+        if env_type == "local":
+            time.sleep(0.25)
+        if getattr(proc_session, "exited", False) is True:
+            _ec = proc_session.exit_code
+            result_data = {
+                "output": (getattr(proc_session, "output_buffer", "") or "").strip()
+                          or "Background command exited immediately.",
+                "session_id": proc_session.id,
+                "pid": proc_session.pid,
+                "status": "exited",
+                "exit_code": _ec,
+                "error": (
+                    f"Background command exited immediately with code {_ec} — it "
+                    f"did NOT keep running. Check the command before relying on it."
+                ) if _ec not in (0, None) else None,
+            }
+        else:
+            result_data = {
+                "output": "Background process started.",
+                "session_id": proc_session.id,
+                "pid": proc_session.pid,
+                "status": "started",
+                # NOT exit_code:0 — the command is still running; success is
+                # unknown. Poll the session for its real outcome.
+                "exit_code": None,
+                "error": None,
+            }
+            if not proc_session.pid:
+                result_data["warning"] = (
+                    "Could not confirm the process started (no PID captured) — "
+                    "verify via the session before relying on it."
+                )
         if approval_note:
             result_data["approval"] = approval_note
         if pty_disabled_reason:
