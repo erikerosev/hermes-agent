@@ -91,6 +91,16 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
             default_assignee=default_assignee,
             max_in_progress_per_profile=max_in_progress_per_profile,
         )
+    # Post-task review: distill durable lessons from newly-completed tasks into the
+    # project naplo.md — closes the self-improvement loop for autonomous kanban work
+    # (naplo write-back itself is primary-only, so workers would otherwise teach
+    # nothing). Gated by HERMES_KANBAN_REVIEW; never blocks dispatch. Skip on dry-run.
+    if not getattr(args, "dry_run", False):
+        try:
+            from hermes_cli import kanban_review
+            kanban_review.review_pending()
+        except Exception:
+            pass
     if getattr(args, "json", False):
         _print_json({
             **{k: getattr(res, k)

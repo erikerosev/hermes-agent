@@ -414,15 +414,21 @@ CURATOR_REVIEW_PROMPT = (
     "goes through skill_manage above so it is ledgered and rollback-able "
     "(issue #96962). Reading files works through skill_view (including "
     "skill_view(name, file_path=...) for support files).\n\n"
-    "'keep' is a legitimate decision ONLY when the skill is already a "
-    "class-level umbrella and none of the proposed merges would improve "
-    "discoverability. 'This is narrow but distinct from its siblings' "
-    "is NOT a reason to keep — it's a reason to move it under an "
-    "umbrella as a subsection or support file.\n\n"
-    "Expected output: real umbrella-ification. Process every obvious "
-    "cluster. If you end the pass with fewer than 10 archives, you "
-    "stopped too early — go back and look at the clusters you left "
-    "alone.\n\n"
+    "'keep' is a legitimate decision when the skill is already a "
+    "class-level umbrella, when no proposed merge would improve "
+    "discoverability, or when the skill is genuinely distinct from every "
+    "sibling in the candidate list.\n\n"
+    # ARÁNYOSSÁG, NEM KVÓTA. Az eredeti prompt itt azt írta: "ha kevesebb mint
+    # 10 archiválással zárod a kört, túl korán álltál meg" — vagyis KÖRÖNKÉNT
+    # LEGALÁBB 10 archiválást követelt, érdemtől függetlenül. Egy kurált
+    # készleten ez kártékony: a modellt arra nyomja, hogy élő, önálló skilleket
+    # gyömöszöljön esernyők alá, hogy kijöjjön a szám. Éles futáson a modell ezt
+    # fel is ismerte és megtagadta — de erre nem szabad hagyatkozni.
+    "Expected output: real umbrella-ification WHERE IT IS WARRANTED. Process "
+    "every obvious cluster. The right number of archives is however many the "
+    "library actually justifies — it may be zero. Do NOT merge skills that "
+    "cover distinct domains just to raise the count, and never treat an "
+    "archive count as a target to hit.\n\n"
     "When done, write a human summary AND a structured machine-readable "
     "block so downstream tooling can distinguish consolidation from "
     "pruning. Format EXACTLY:\n\n"

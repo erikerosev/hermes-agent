@@ -2951,6 +2951,13 @@ def run_daemon(
                     max_in_progress=max_in_progress,
                     failure_limit=failure_limit,
                 )
+            # Post-task review: distill lessons from completed tasks into project
+            # naplo.md (self-improvement loop for autonomous work). Never blocks the tick.
+            try:
+                from hermes_cli import kanban_review
+                kanban_review.review_pending()
+            except Exception:
+                pass
             if on_tick is not None:
                 with contextlib.suppress(Exception):
                     on_tick(res)
