@@ -60,3 +60,43 @@ Bázis: `v2026.9.24`, branch `apollo-v2026-09`. A régi fork 31 commitja a
 - CLI-verzió: a plugin 2.1.263-ra kvalifikált, mi 2.1.276-ot futtatunk. Nincs
   verzió-kapu a kódban, de nem tesztelt.
 - Friss processz kérésenként → latencia-regresszió lehet. Mérni kell.
+
+---
+
+## BLOKKOLÓ a cutover előtt (2026-10-05): a saját MCP-szerverek nem érik el a modellt
+
+A négy saját MCP-szerver (`kozos` memória, `behavior` szabály-tár, `reminder`,
+`atlassian-ro`) **Hermes-oldalon rendben bekötődik**, de a tooljaik NEM jutnak el a
+modellhez a gateway-úton. Enélkül Apollo elveszti a közös memóriát, az önmódosuló
+szabály-tárat, az emlékeztetőket és a Jira/Confluence-hozzáférést — tehát ez
+cutover-blokkoló.
+
+### Ami bizonyítottan RENDBEN van
+- `hermes mcp add` mind a négyet felvette; `hermes mcp list` → `✓ enabled`
+- a `config.yaml` `mcp_servers` szekciója helyes (command/args/enabled)
+- a szerverek elindulnak és válaszolnak a `ListToolsRequest`-re (`logs/mcp-stderr.log`)
+- `mcp_schema_cache.json` megvan (23 KB)
+- a toolset-feloldás TARTALMAZZA őket: `_get_platform_tools(cfg,"api_server")` →
+  `['approval','atlassian-ro','behavior',…,'kozos','reminder',…]` (19 toolset)
+- sima processzben a katalógus HELYES: `register_mcp_servers(servers)` után a
+  `tool_search` leírásában **33 `mcp__*` név** van (előtte 0)
+
+### Ahol elvész
+- a gateway CSAK `discover_mcp_tools()`-t hív (`gateway/run.py`
+  `_discover_gateway_mcp_tools`), ami `_owner_secret_scope()`-on BELÜL regisztrál
+- a kiszolgáló forduló más scope-ot olvas → a modell `tool_search`-e csak 4 natív
+  halasztott toolt lát (cronjob, session_search, terminal, todo), és Apollo azt
+  válaszolja: „nincs Jira-eszköz bekötve"
+- `refresh_agent_mcp_tools(agent)` ezen önmagában NEM segít: a regiszterből
+  derivál, ami ezen a ponton üres (visszatérési értéke üres halmaz) — a hívást
+  mégis bekötöttem az api_server agent-buildbe, mert elvileg helyes és fail-safe
+- `register_mcp_servers()` beinjektálása a gateway-indulásba NEM hatott
+  (sem `load_config()`, sem `tools.mcp_tool_config._load_mcp_config()` olvasóval)
+  → a kísérlet VISSZAVÉVE, hogy ne maradjon halott kód
+
+### Opciók
+1. A scope-kezelés további debugolása (`_owner_secret_scope`, a per-profil
+   `mcp-<server>` overlay, `_reregister_orphaned_adopters`)
+2. Upstream-bejelentés/PR — ez az ő integrációs hibájuk, nem a mi forkunké
+3. HIBRID cutover: a négy MCP-szerver maradjon a mai claude-cli úton, a többi
+   menjen a plugin alatt (kétféle út egyszerre — ezt NEM javaslom tartósan)
