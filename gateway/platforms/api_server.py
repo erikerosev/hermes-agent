@@ -2278,25 +2278,6 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             "provider": runtime_kwargs.get("provider") or getattr(agent, "provider", "") or "",
             "model": getattr(agent, "model", None) or model,
             "route_source": route_source}
-        # MCP-toolok újra-deriválása a FRISS regiszterből. Az AIAgent build-time-ban
-        # snapshotolja az `agent.tools`-t, a gateway MCP-felderítése viszont külön
-        # executor-szálon fut (`_discover_gateway_mcp_tools` → `copy_context().run`),
-        # ezért a stdio-szerverek toolja ezen az úton SOSE jutott el a modellhez:
-        # mérve a `kozos` (memória), `behavior` (szabály-tár), `reminder` és
-        # `atlassian-ro` mind `enabled`, a toolset-feloldás is tartalmazza őket, a
-        # `tool_search` katalógusa sima processzben 33 `mcp__*` nevet listáz — a
-        # gateway-en viszont a modell csak 4 natív halasztott toolt látott, és azt
-        # válaszolta, hogy "nincs Jira-eszköz bekötve". A `refresh_agent_mcp_tools`
-        # pontosan ezért létezik (a saját docstringje: "servers that connect later
-        # are invisible until rebuilt") — csak ezt az utat kihagyta. Fail-safe: a
-        # hiba sosem dönti el a fordulót.
-        try:
-            from tools.mcp_tool_agent import refresh_agent_mcp_tools
-            _added = refresh_agent_mcp_tools(agent, quiet_mode=True, preserve_prefix=True)
-            if _added:
-                logger.info("api_server: %d MCP-tool csatolva a frissítéssel", len(_added))
-        except Exception:
-            logger.debug("api_server: MCP-tool frissítés nem sikerült", exc_info=True)
         return agent
 
     # -- HTTP handlers ----------------------------------------------------------------
