@@ -1085,6 +1085,56 @@ except Exception:  # pragma: no cover - scanner is optional hardening
     _scan_cron_prompt = None
 
 
+# Fordulónkénti állványzat: a kliens (fenris) a user-üzenet VÉGÉRE fűzi a memória-
+# visszakeresést és a viselkedési kapukat. Ezek EGYETLEN fordulóra szólnak, viszont a
+# transcriptbe is bekerültek és onnantól MINDEN modell-hívásban újra elmentek.
+#
+# MÉRVE (2026-10-06, egy valódi 342 üzenetes munka-szálon): a szál 75.370 tokenjéből
+# ~48.700 token ez az állványzat — a user-üzenetek 91,2%-a. Ebből a KAPUK 79,8%
+# (~38.900 token), a memória-blokk 20,2% (~9.900 token). Erik saját szövege a
+# user-üzenetek 6,3%-a, átlag 75 karakter. A prompt így hívásonként 189.368 token
+# volt, és ez adta a 6-11 másodperces alapot (egy tool-os forduló 6 hívás = 74 s).
+#
+# A `run_conversation(persist_user_message=...)` pontosan erre van: az upstream
+# docstringje szerint "some paths send an API-only variant that must not leak into
+# transcripts or resumed history", és CSAK a DB-sorra alkalmazódik — a modellnek
+# átadott lista változatlan (#48677). Tehát a kapu/memória a fordulóban megkapja a
+# modellt, de nem ragad be a történetbe.
+_TURN_SCAFFOLD_MARKERS = (
+    "## Releváns a közös életetekből",
+    "## Naptár",
+    "## A felhasználó közelgő",
+    "## ⚠️ EZ A FORDULÓ",
+    "[RENDSZER",
+)
+
+
+def _strip_turn_scaffold(content):
+    """A fordulónkénti állványzat levágása a TÁROLT user-üzenetről. ``None``, ha nincs
+    mit vágni (akkor a hívó nem ad override-ot, és a mai viselkedés marad)."""
+    def _cut(text: str):
+        pos = [text.find(m) for m in _TURN_SCAFFOLD_MARKERS]
+        pos = [p for p in pos if p > 0]          # p == 0 nem lehet: a kliens FŰZI
+        if not pos:
+            return None
+        return text[:min(pos)].rstrip()
+    if isinstance(content, str):
+        return _cut(content)
+    if isinstance(content, list):
+        out, changed = [], False
+        for part in content:
+            if isinstance(part, dict) and part.get("type") in (None, "text") and isinstance(part.get("text"), str):
+                cut = _cut(part["text"])
+                if cut is not None:
+                    changed = True
+                    if cut:
+                        out.append({**part, "text": cut})
+                    continue
+            out.append(part)
+        return out if changed else None
+    return None
+
+
 class _ProviderAuthResolutionError(RuntimeError):
     """Provider credential resolution failed. Typed so callers never mislabel other
     RuntimeErrors from run_conversation() (e.g. a closed OpenAI client) as auth failures."""
@@ -4086,6 +4136,11 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
                         task_id=effective_task_id,
                         **author_kwargs,
                     )
+                    # A fordulónkénti állványzat (memória-blokk + kapuk) ne kerüljön a
+                    # transcriptbe — lásd _strip_turn_scaffold.
+                    _clean = _strip_turn_scaffold(user_message)
+                    if _clean is not None:
+                        conversation_kwargs["persist_user_message"] = _clean
                     if relay_metadata:
                         conversation_kwargs["relay_metadata"] = relay_metadata
                     with notification_turn(agent, muted=muted, session_id=session_id or ""):
