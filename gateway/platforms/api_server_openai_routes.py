@@ -857,6 +857,7 @@ class OpenAICompatRoutesMixin:
             return {"id": completion_id, "object": "chat.completion.chunk", "created": created,
                     "model": model,
                     "choices": [{"index": 0, "delta": delta, "finish_reason": finish_reason}], **extra}
+        wrote_content = False
         try:
             await response.write(_sse_frame(_chunk({"role": "assistant"})))
             async for delta in _iter_stream_items(stream_q, agent_task, response):
@@ -876,6 +877,7 @@ class OpenAICompatRoutesMixin:
                     # answers on POST /v1/clarify; a strict OpenAI client just ignores it.
                     await response.write(_sse_frame(delta[1], event="hermes.clarify"))
                 else:
+                    wrote_content = True
                     await response.write(_sse_frame(_chunk({"content": delta})))
             # The agent can fail after the queue drains (task raises / result flagged failed or
             # partial): surface a non-"stop" finish_reason like the non-streaming path.
@@ -891,6 +893,18 @@ class OpenAICompatRoutesMixin:
             if agent_error is not None:
                 is_failed = True
                 err_msg = err_msg or str(agent_error)
+            # NEM-STREAMELŐ provider: a külső-processzes providereknél (directsdk → a
+            # `claude` CLI) a `_should_stream()` SZÁNDÉKOSAN kikapcsolja a streamelést
+            # (agent/turn_api_call.py: `_is_external_process_provider`), így egyetlen
+            # content-delta sem érkezik — a válasz a `result["final_response"]`-ban van.
+            # A Responses-út ezt már kezeli (`_ResponsesStream.collect_result`: "produced a
+            # final_response but streamed no deltas"); a chat-completions író nem, ezért
+            # a kliens ÜRES választ kapott (mérve: 2 frame, csak role + finish).
+            if not wrote_content:
+                _final = result.get("final_response", "") if isinstance(result, dict) else ""
+                if _final:
+                    await response.write(_sse_frame(_chunk({"content": _final})))
+                    wrote_content = True
             finish_reason = _finish_reason(completed, is_partial, is_failed, err_msg, agent_error)
             finish_chunk = _chunk({}, finish_reason, usage=_chat_usage_payload(usage))
             presentation_muted = (
