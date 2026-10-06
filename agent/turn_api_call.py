@@ -44,6 +44,9 @@ class ApiCallVerdict:
     interrupted: Any
 
 
+import os
+
+
 def _should_stream(agent: Any) -> bool:
     """Streaming is preferred even without consumers (stale-stream / read-timeout health
     checks); disabled on provider signal, ACP providers (``acp://`` scheme or an
@@ -54,8 +57,27 @@ def _should_stream(agent: Any) -> bool:
     _base = str(agent.base_url or "").lower()
     from hermes_cli.runtime_provider_backends import _is_external_process_provider
 
-    if _base.startswith(("acp://", "acp+tcp://")) or _is_external_process_provider(agent.provider):
+    if _base.startswith(("acp://", "acp+tcp://")):
         return False
+    if _is_external_process_provider(agent.provider):
+        # A blanket külső-processz-tiltás az ACP-providerek miatt van (grok/kiro/junie),
+        # de NEM minden ilyen provider streamel rosszul: a
+        # claude-subscription-directsdk a `claude` CLI stream-json kimenetét
+        # progresszíven adja tovább (mérve: 2,48 s első token, folyamatos deltákkal).
+        #
+        # Enélkül a kliens egyetlen blokkban kapja a választ a végén: MÉRVE élesben
+        # első-tartalom == teljes idő (8,15 s / 8,16 s, 1 chunk) — a felület halott,
+        # amíg kész nem lesz, és ettől tűnt el minden "gyors kör" érzete.
+        #
+        # Allowlist env-ből (vesszős providernév-lista), hogy az ACP-sek védve
+        # maradjanak. Biztonságos: ha a stream mégsem ad tartalmat, a
+        # chat-completions író a `result["final_response"]`-t írja ki a végén
+        # (lásd api_server_openai_routes.py `wrote_content`), tehát a legrosszabb
+        # eset a MAI viselkedés.
+        _allow = os.environ.get("HERMES_STREAM_EXTERNAL_PROVIDERS", "")
+        _names = {n.strip().lower() for n in _allow.split(",") if n.strip()}
+        if str(agent.provider or "").strip().lower() not in _names:
+            return False
     if not agent._has_stream_consumers():
         if agent.provider == "moa":
             return False
