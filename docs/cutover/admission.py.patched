@@ -1,6 +1,9 @@
 """Request-scoped native HTTP admission; credentials are forwarded, never persisted."""
 import codecs
 import copy
+import datetime
+import os
+from pathlib import Path
 import http.client
 from http.server import BaseHTTPRequestHandler, HTTPServer
 import ipaddress
@@ -25,6 +28,43 @@ def _plain(block):
 # 2.1.276 `context_management`-et is kuld, amitol MINDEN tool-os forduló 400-azik
 # (az egyszeru fordulok atmennek). Mert: 2026-10-06, elo cutover.
 _UNSUPPORTED_TOP_LEVEL = ('context_management',)
+
+
+def _audit_payload_blocks(payload):
+    """Egy JSON sor arról, MI van a tényleges upstream kérésben: blokk-típusok darabszáma
+    és karaktermérete. TARTALMAT NEM ír ki. Azt a kérdést hivatott eldönteni, hogy a régi
+    fordulók gondolatmenete (thinking blokkok) valóban újramegy-e minden hívásban."""
+    try:
+        body = json.loads(payload)
+        if not isinstance(body, dict):
+            return
+        kinds, roles = {}, {}
+        for m in body.get('messages') or []:
+            roles[m.get('role')] = roles.get(m.get('role'), 0) + 1
+            c = m.get('content')
+            if isinstance(c, str):
+                k = 'text(str)'
+                kinds.setdefault(k, [0, 0])
+                kinds[k][0] += 1
+                kinds[k][1] += len(c)
+                continue
+            for b in (c or []):
+                if not isinstance(b, dict):
+                    continue
+                k = b.get('type', '?')
+                kinds.setdefault(k, [0, 0])
+                kinds[k][0] += 1
+                kinds[k][1] += len(json.dumps(b, ensure_ascii=False))
+        line = {'ts': datetime.datetime.now().isoformat(timespec='seconds'),
+                'msgs': sum(roles.values()), 'roles': roles,
+                'sys_chars': len(json.dumps(body.get('system') or '', ensure_ascii=False)),
+                'blocks': {k: {'n': v[0], 'chars': v[1]} for k, v in sorted(kinds.items(), key=lambda kv: -kv[1][1])}}
+        d = Path(os.path.expanduser('~/.hermes/logs'))
+        d.mkdir(parents=True, exist_ok=True)
+        with open(d / 'directsdk-payload-audit.log', 'a', encoding='utf-8') as fh:
+            fh.write(json.dumps(line, ensure_ascii=False) + '\n')
+    except Exception:
+        pass
 
 
 def strip_unsupported_fields(payload):
@@ -236,6 +276,7 @@ class Handler(BaseHTTPRequestHandler):
             self.connection.settimeout(gate.timeout)
             payload = self.rfile.read(int(self.headers['Content-Length']))
             payload = strip_unsupported_fields(payload)
+            _audit_payload_blocks(payload)
             payload = pin_message_breakpoint(payload, gate.queried)
             target = gate.upstream
             if target.scheme == 'https':
