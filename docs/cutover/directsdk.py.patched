@@ -421,7 +421,8 @@ def _timing_record(stats, model):
                 'total': round(total, 2), 'spawn': round(stats['spawn'], 2) if stats['spawn'] else None,
                 'first_event': round(stats['first'], 2) if stats['first'] else None,
                 'max_gap': round(stats['gap'], 2), 'gap_after': stats['gap_after'], 'events': stats['events'],
-                'usage': stats.get('usage'), 'stop': stats.get('stop')}
+                'usage': stats.get('usage'), 'stop': stats.get('stop'),
+                'denied': stats.get('denied'), 'req_id': stats.get('req_id')}
         _TIMING_DIR.mkdir(parents=True, exist_ok=True)
         with open(_TIMING_DIR / 'directsdk-timing.log', 'a', encoding='utf-8') as fh:
             fh.write(json.dumps(line) + '\n')
@@ -720,8 +721,15 @@ class Client:
                                     'completion_tokens_details': {'reasoning_tokens': usage.get('output_tokens_details', {}).get('thinking_tokens', 0)},
                                     'native_cost': {'total_cost_usd': final.get('total_cost_usd'), 'modelUsage': final.get('modelUsage')}}
                 stats['usage'] = {'in': inp, 'cached': usage.get('cache_read_input_tokens', 0), 'out': usage['output_tokens'],
-                                  'think': usage.get('output_tokens_details', {}).get('thinking_tokens', 0)}
+                                  'think': usage.get('output_tokens_details', {}).get('thinking_tokens', 0),
+                                  'create': usage.get('cache_creation_input_tokens', 0)}
                 stats['stop'] = assistants[-1].get('stop_reason')
+                # A relay egyszeri-beengedést csinál: ha a native BELÜL újrapróbálkozik,
+                # a második kérés megtagadva landol itt. A ~30 s-os egységekben jelentkező
+                # elakadásoknál ez választja el a "CLI retryzik" és az "upstream lassú az
+                # első tokenig" hipotézist — ezért kerül a naplóba.
+                stats['denied'] = admission.denied
+                stats['req_id'] = admission.request_id
                 normalized_usage['native_admission'] = {'upstream_requests': int(admission.used), 'blocked_requests': admission.denied, 'request_id': admission.request_id}
                 finish = 'tool_calls' if calls else ('length' if any(a.get('stop_reason') in ('max_tokens', 'model_context_window_exceeded') for a in assistants) else 'stop')
                 response = obj({'id': assistants[-1].get('id', 'claude-native'), 'model': kwargs['model'], 'object': 'chat.completion', 'choices': [{'index': 0, 'finish_reason': finish, 'message': message}], 'usage': normalized_usage})
