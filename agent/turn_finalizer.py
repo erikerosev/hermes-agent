@@ -34,11 +34,6 @@ _SESSION_TOKEN_KEYS = (
 )
 _SESSION_COST_KEYS = ("estimated_cost_usd", "cost_status", "cost_source")
 
-# Méret-kapus micro-compaction: hány behajtást engedünk EGY forduló lezárásában. Minden
-# behajtás egy aux-LLM hívás, tehát ez szabja meg, meddig nyúlhat a lezárás; ami nem fér
-# bele, azt a következő forduló végén folytatja. 1 = a mai viselkedés (egy kör).
-_MICRO_COMPACT_MAX_PASSES_PER_TURN = 4
-
 
 def _assistant_row_missing_visible_text(msg: dict) -> bool:
     """True when an assistant row has no visible text (blank final or tool-only)."""
@@ -303,21 +298,12 @@ def _micro_compact_after_turn(agent, messages, final_response, logger) -> None:
                 agent._db_flush_scan_prefix = None
             if isinstance(_compacted, list) and _compacted:
                 messages[:] = _compacted
-            # Méret-kapunál egy forduló egy váltást hajt be, ami egy tool-nehéz forduló után
-            # (akár 30 hívás, több tízezer token) nem hozza a határ alá. Ezért addig ismételjük,
-            # amíg a kapu zár — körönkénti felső korláttal, hogy a lezárás ne nyúljon hosszúra:
-            # ami ma nem fér bele, azt a következő forduló végén folytatja.
-            _above = max(0, int(getattr(_compressor, "_micro_compact_above_tokens", 0) or 0))
-            if _above:
-                for _ in range(_MICRO_COMPACT_MAX_PASSES_PER_TURN - 1):
-                    _n = len(messages)
-                    _more = _compressor._micro_compact(messages)
-                    if getattr(_compressor, "_flush_scan_cursor_invalidated", False):
-                        _compressor._flush_scan_cursor_invalidated = False
-                        agent._db_flush_scan_prefix = None
-                    if not (isinstance(_more, list) and _more) or len(_more) == _n:
-                        break  # no-op kör (kapu zárva vagy nincs több behajtható váltás)
-                    messages[:] = _more
+            # VISSZAVÉVE 2026-10-08: itt egy többkörös ciklus volt (max 4 behajtás fordulónként),
+            # hogy a méret-kapu egy fordulóban lezárjon. HIBÁS VOLT: minden behajtás
+            # `archive_and_compact`-tal szinkronizál a DB-be, és a helyben átírt sorokról lekerül
+            # a _DB_PERSISTED_MARKER — így a második szinkron már nem ismerte fel őket, és újra
+            # kiírta. Mérve: egy teszt-szálban ugyanaz az üzenet 11 példányban (18 forduló).
+            # Fordulónként EGY behajtás az upstream szerződése; a kapu több fordulón át zárja le.
             if _before != len(messages):
                 logger.info("Micro-compaction: %d -> %d messages", _before, len(messages))
     except Exception as _mc_err:

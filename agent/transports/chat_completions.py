@@ -255,6 +255,38 @@ def _model_consumes_thought_signature(model: Any) -> bool:
     return "gemini" in m or "gemma" in m
 
 
+_CARRY_LAST_N_UNSET = object()
+_carry_last_n_cache: Any = _CARRY_LAST_N_UNSET
+
+
+def _reasoning_carry_last_n(_agent: Any = None) -> int:
+    """``agent.reasoning_carry_last_n``: hány legutóbbi asszisztens-forduló natív hordozója
+    (``reasoning_details``) menjen vissza a providerhez. 0 = mind (a mai viselkedés).
+
+    A configból olvassa, processzenként egyszer: a transportnak nincs agent-referenciája,
+    és a kulcs a futás alatt nem változik (a gateway restartnál olvas újra).
+    """
+    global _carry_last_n_cache
+    if _carry_last_n_cache is _CARRY_LAST_N_UNSET:
+        value = 0
+        try:
+            from hermes_cli.config import cfg_get, load_config_readonly
+            raw = cfg_get(load_config_readonly(), "agent", "reasoning_carry_last_n", default=0)
+            value = max(0, int(raw or 0))
+        except Exception:
+            value = 0
+        _carry_last_n_cache = value
+    return _carry_last_n_cache
+
+
+def _old_carrier_indices(messages: Any, keep_last_n: int) -> frozenset:
+    """Azoknak az asszisztens-üzeneteknek az indexei, amelyek hordozóját EL kell hagyni:
+    minden, ami a legutóbbi ``keep_last_n`` hordozós asszisztens-fordulónál régebbi."""
+    carriers = [i for i, m in enumerate(messages)
+                if isinstance(m, dict) and m.get("role") == "assistant" and m.get("reasoning_details")]
+    return frozenset(carriers[:-keep_last_n]) if len(carriers) > keep_last_n else frozenset()
+
+
 def _route_replays_reasoning_details(base_url: Any) -> bool:
     """True when the target route reads replayed ``reasoning_details`` (OpenRouter's unified
     reasoning array, also consumed by the Nous Portal).
@@ -453,8 +485,22 @@ class ChatCompletionsTransport(ProviderTransport):
         # A profile declaring a native carrier type consumes replayed details by contract.
         native_type = getattr(kwargs.get("provider_profile"), "native_reasoning_details_type", None) or None
         strip_reasoning_details = not (native_type or _route_replays_reasoning_details(kwargs.get("base_url")))
-        sanitized_pairs = [(m, _sanitize_message(m, strip_extra_content, strip_reasoning_details, native_type))
-                           for m in messages]
+        # A natív hordozó (reasoning_details) a FUTÓ forduló tool-hurkához kell: az aláírt
+        # thinking blokkokat vissza kell játszani, különben a modell elveszti a fonalat két
+        # tool-kör között. A HETEKKEL EZELŐTTI fordulók gondolatmenetéhez viszont nem — a
+        # következtetés a látható válaszban van. Mérve 2026-10-08 egy valódi szálon: 65
+        # thinking blokk, 29 265 token, a kérés blokkjainak 42%-a, 2,2× annyi mint maga a
+        # beszélgetés (13 181 token).
+        # Hordozó nélkül a provider a látható szövegből + tool_calls-ból építi újra a fordulót
+        # (gondolatmenet nélkül) — ez a plugin SAJÁT, támogatott visszaesési útja, amit a host
+        # minden history-átírásakor használ, nem kerülőút.
+        # 0 = a mai viselkedés (minden hordozó megy). N = csak az utolsó N asszisztens-forduló.
+        _carry_n = _reasoning_carry_last_n(kwargs.get("agent"))
+        _strip_old = _old_carrier_indices(messages, _carry_n) if (_carry_n and not strip_reasoning_details) else frozenset()
+        sanitized_pairs = [
+            (m, _sanitize_message(m, strip_extra_content, strip_reasoning_details or (i in _strip_old), native_type))
+            for i, m in enumerate(messages)
+        ]
         if all(s is None for _, s in sanitized_pairs):
             return messages
         return [m if s is None else s for m, s in sanitized_pairs]

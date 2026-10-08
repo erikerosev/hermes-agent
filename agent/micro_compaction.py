@@ -257,6 +257,18 @@ class MicroCompactionMixin:
 
         exchange_text = self._serialize_for_summary(messages[exchange_start:exchange_end])
         _exchange_tokens = estimate_tokens_rough(exchange_text)
+        # ALSÓ KORLÁT. Egy behajtás prózát ír a váltásról, és a próza alul nem megy egy
+        # bizonyos méret alá — egy apró váltásról írt összefoglaló NAGYOBB, mint amit elvisz.
+        # Mérve 2026-10-08: exchange_tokens=70, és a forduló tokenszáma 80 942 -> 81 609, azaz
+        # +~700 KÖRÖNKÉNT; a méret-kapu így soha nem zárt, viszont minden körben fizettük a
+        # cache-törést és egy aux-hívást. (A nyesés-útnak van ilyen fékje:
+        # proactive_prune_min_reclaim_tokens — a behajtás-útnak nem volt.)
+        # Az apró váltást NEM foglaljuk össze, csak átlépjük: olcsó, maradhat szó szerint.
+        if _exchange_tokens < self._micro_compact_min_exchange_tokens:
+            self._micro_compact_cursor = exchange_end
+            _telemetry("skipped_too_small", messages, tokens_after=_tokens_before,
+                       exchange_tokens=_exchange_tokens)
+            return messages
         updated_summary = self._micro_summarize_one(exchange_text)
         if updated_summary is None:
             _outcome = self._record_micro_failure(exchange_start, exchange_end)

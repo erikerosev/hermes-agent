@@ -260,6 +260,16 @@ DEFAULT_CONFIG = {
         # Model name (any reasonable spelling) -> effort level; overrides agent.reasoning_effort
         # when the current model matches. Edit in config.yaml (no CLI support: dots in keys).
         "reasoning_overrides": {},
+        # reasoning_carry_last_n: how many of the most recent assistant turns replay their native
+        # reasoning carrier (`reasoning_details`) to the provider. The carrier holds the signed
+        # thinking blocks the model needs to stay coherent ACROSS TOOL ROUNDS OF THE CURRENT TURN;
+        # weeks-old turns do not need it (their conclusion is in the visible answer). Without the
+        # carrier the provider rebuilds the turn from visible text + tool_calls — the same
+        # supported fallback it uses whenever host compaction rewrote history.
+        # Measured on a live thread (2026-10-08): 65 carried thinking blocks = 29,265 tokens =
+        # 42% of the request's blocks, 2.2x the conversation text itself.
+        # 0 = carry all (previous behaviour). Only affects native-carrier routes.
+        "reasoning_carry_last_n": 0,
         # Preserve assistant `reasoning_content` on history replay. Echo families (DeepSeek,
         # Kimi/Moonshot, Xiaomi MiMo) are auto-detected by provider name/base-URL host; custom
         # providers and OpenAI-compatible gateways proxying them are not. Set `reasoning_echo: true`

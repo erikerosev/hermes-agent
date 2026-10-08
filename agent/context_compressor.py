@@ -2710,6 +2710,9 @@ class ContextCompressor(SummaryDispatchMixin, MicroCompactionMixin, ContextEngin
         # A forduló-szám csak proxy; a cache-törés akkor ér valamit, ha a kontextus
         # tényleg a határ fölött van.
         self._micro_compact_above_tokens: int = 0
+        # Alsó korlát: ennél kisebb váltást nem foglalunk össze (az összefoglalója nagyobb
+        # lenne, mint amit elvisz) — csak átlépjük.
+        self._micro_compact_min_exchange_tokens: int = 1500
         # Deferred: get_model_context_length() may issue a sync HTTP probe that must not block construction.
         # Floor and cap are applied on first resolution (see _resolve_context_length / threshold_tokens).
         # The small-context threshold floor and the absolute threshold cap both need the resolved window, so
