@@ -1546,6 +1546,11 @@ def _parse_compression_config(agent, _agent_cfg) -> CompressionSettings:
         micro_compact_defrag_tokens=max(
             1, _parse_config_int(cfg.get("micro_compact_defrag_threshold_tokens", 2000), 2000)
         ),
+        # Méret-kapu a cadence helyett: a forduló után addig hajt be váltásokat, amíg az élő
+        # kontextus ennyi token alá nem kerül. 0 = off (marad a cadence).
+        micro_compact_above_tokens=max(
+            0, _parse_config_int(cfg.get("micro_compact_above_tokens", 0), 0)
+        ),
         codex_app_server_auto=app_server_auto,
         codex_responses_native=responses_native,
         codex_responses_compact_threshold=compact_threshold,
@@ -1983,6 +1988,7 @@ def _build_context_engine(agent, _agent_cfg, cs, _custom_providers, _effective_c
         ("_micro_compact_enabled", cs.micro_compact),
         ("_micro_compact_every_n_turns", cs.micro_compact_every_n_turns),
         ("_micro_compact_defrag_threshold_tokens", cs.micro_compact_defrag_tokens),
+        ("_micro_compact_above_tokens", cs.micro_compact_above_tokens),
     ):
         if hasattr(_cc, _attr):
             setattr(_cc, _attr, _value)

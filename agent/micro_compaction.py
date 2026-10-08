@@ -207,14 +207,23 @@ class MicroCompactionMixin:
         if not self._micro_compact_enabled:
             return messages
 
-        # Cadence gate: each pass breaks prompt cache once. Counted per invocation so a no-op turn
-        # can't wedge it.
-        every_n = max(1, int(self._micro_compact_every_n_turns or 1))
-        if every_n > 1:
-            self._micro_compact_turns_since_pass += 1
-            if self._micro_compact_turns_since_pass < every_n:
+        # Méret-kapu (ha be van állítva) a cadence HELYETT: a forduló-szám csak proxy —
+        # egy forduló lehet 200 token és lehet 50 000, ezért a „minden N. kör" nem köthető
+        # ahhoz, hogy a cache-törés megér-e bármit. Token-kapuval a törést csak akkor
+        # fizetjük, amikor valóban szűkíteni kell. 0 = kapcsolva ki, és marad a cadence.
+        above = max(0, int(getattr(self, "_micro_compact_above_tokens", 0) or 0))
+        if above:
+            if estimate_messages_tokens_rough(messages) <= above:
                 return messages
-            self._micro_compact_turns_since_pass = 0
+        else:
+            # Cadence gate: each pass breaks prompt cache once. Counted per invocation so a no-op turn
+            # can't wedge it.
+            every_n = max(1, int(self._micro_compact_every_n_turns or 1))
+            if every_n > 1:
+                self._micro_compact_turns_since_pass += 1
+                if self._micro_compact_turns_since_pass < every_n:
+                    return messages
+                self._micro_compact_turns_since_pass = 0
 
         n_messages = len(messages)
         exchange = self._next_exchange(messages) if n_messages >= 4 else None

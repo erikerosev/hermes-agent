@@ -606,6 +606,13 @@ DEFAULT_CONFIG = {
         "micro_compact_every_n_turns": 1,
         # Once the rolling summary exceeds this many tokens, the next pass re-summarizes it.
         "micro_compact_defrag_threshold_tokens": 2000,
+        # micro_compact_above_tokens: size gate INSTEAD of the turn cadence. After a turn, keep
+        # folding the oldest exchange while the live context exceeds this many tokens (capped per
+        # turn; the rest continues next turn). Turn count is only a proxy — one turn can add 200
+        # tokens or 50,000 — so cadence cannot tell whether a cache break buys anything, while a
+        # size gate pays the break only when the context actually needs shrinking.
+        # 0 = off (micro_compact_every_n_turns applies).
+        "micro_compact_above_tokens": 0,
         # Gateway session-hygiene force-compress threshold, by message count.
         "hygiene_hard_message_limit": 5000,
         # Max seconds the gateway waits for pre-agent hygiene compression WITHOUT forward progress.

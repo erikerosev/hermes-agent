@@ -2706,6 +2706,10 @@ class ContextCompressor(SummaryDispatchMixin, MicroCompactionMixin, ContextEngin
         self._micro_compact_passes = self._micro_compact_tokens_saved_total = self._micro_compact_turns_since_pass = 0
         # Cadence dial: how often the cache-breaking pass is paid. 1 = every turn.
         self._micro_compact_every_n_turns: int = 1
+        # Méret-kapu: a cadence HELYETT token-határra tüzel (0 = off, marad a cadence).
+        # A forduló-szám csak proxy; a cache-törés akkor ér valamit, ha a kontextus
+        # tényleg a határ fölött van.
+        self._micro_compact_above_tokens: int = 0
         # Deferred: get_model_context_length() may issue a sync HTTP probe that must not block construction.
         # Floor and cap are applied on first resolution (see _resolve_context_length / threshold_tokens).
         # The small-context threshold floor and the absolute threshold cap both need the resolved window, so
