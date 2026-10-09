@@ -374,12 +374,26 @@ def compress_after_tool_results(
         # proactive_prune_tokens is exceeded; commits only past
         # proactive_prune_min_reclaim_tokens so cache breaks stay episodic.
         _prune = getattr(_compressor, "prune_tool_results_only", None)
+        # DIAGNOSZTIKA (Apollo): a nyesés minden no-opja CSENDES a küszöb alatt
+        # (`_warn_reclamation_no_op` szándékosan csak threshold_tokens fölött szól), ezért
+        # élesben nem lehetett megállapítani, hogy a 48k-s kapu egyáltalán megnyílik-e.
+        # Egy sor, a döntés BEMENETEIVEL — ez az egyetlen módja, hogy a „beállítottuk, de
+        # nem hat" hibaosztályt a helyszínen lássuk.
+        logger.info(
+            "prune gate: tokens=%s trigger=%s min_chars=%s min_reclaim=%s rearm=%s msgs=%d callable=%s",
+            _real_tokens, getattr(_compressor, "proactive_prune_tokens", None),
+            getattr(_compressor, "proactive_prune_min_result_chars", None),
+            getattr(_compressor, "proactive_prune_min_reclaim_tokens", None),
+            getattr(_compressor, "_proactive_prune_rearm_tokens", None),
+            len(messages), callable(_prune),
+        )
         if callable(_prune):
             try:
                 _pruned_msgs, _pruned_n = _prune(messages, current_tokens=_real_tokens)
             except Exception:
                 logger.debug("proactive tool-result prune failed; skipping", exc_info=True)
                 _pruned_msgs, _pruned_n = messages, 0
+            logger.info("prune result: pruned=%s new_object=%s", _pruned_n, _pruned_msgs is not messages)
             # Standard no-op caller contract: only commit when the engine returned a
             # NEW list object with a non-zero count. Do NOT rebuild
             # conversation_history: rows already carry _DB_PERSISTED_MARKER, and on a
