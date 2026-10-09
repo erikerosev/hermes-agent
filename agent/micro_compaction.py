@@ -257,18 +257,18 @@ class MicroCompactionMixin:
 
         exchange_text = self._serialize_for_summary(messages[exchange_start:exchange_end])
         _exchange_tokens = estimate_tokens_rough(exchange_text)
-        # ALSÓ KORLÁT. Egy behajtás prózát ír a váltásról, és a próza alul nem megy egy
-        # bizonyos méret alá — egy apró váltásról írt összefoglaló NAGYOBB, mint amit elvisz.
-        # Mérve 2026-10-08: exchange_tokens=70, és a forduló tokenszáma 80 942 -> 81 609, azaz
-        # +~700 KÖRÖNKÉNT; a méret-kapu így soha nem zárt, viszont minden körben fizettük a
-        # cache-törést és egy aux-hívást. (A nyesés-útnak van ilyen fékje:
-        # proactive_prune_min_reclaim_tokens — a behajtás-útnak nem volt.)
-        # Az apró váltást NEM foglaljuk össze, csak átlépjük: olcsó, maradhat szó szerint.
-        if _exchange_tokens < self._micro_compact_min_exchange_tokens:
+        # ELŐ-SZŰRŐ (alapból KI, 0): csak akkor hagyja ki a váltást a MÉRÉS előtt, ha
+        # valaki szándékosan beállítja. 2026-10-08-án 1500-ra állítottam — és ezzel a
+        # funkciót kinulláztam: a Torus-szálon MINDEN fordulón `skipped_too_small` lett
+        # (a váltások kicsik, egyenként), a próza fordulónként ~8 000 tokennel nőtt, és a
+        # szál a 256k-s blokkoló tömörítésbe futott. A 35 egység-teszt közül 20 is elhasalt
+        # tőle. A méret rossz proxy volt — a mért EREDMÉNY a helyes kapu, lásd alább.
+        if self._micro_compact_min_exchange_tokens and _exchange_tokens < self._micro_compact_min_exchange_tokens:
             self._micro_compact_cursor = exchange_end
             _telemetry("skipped_too_small", messages, tokens_after=_tokens_before,
                        exchange_tokens=_exchange_tokens)
             return messages
+        _summary_before = self._micro_compact_rolling_summary
         updated_summary = self._micro_summarize_one(exchange_text)
         if updated_summary is None:
             _outcome = self._record_micro_failure(exchange_start, exchange_end)
@@ -280,6 +280,39 @@ class MicroCompactionMixin:
         self._reset_micro_failure_tracking()
 
         result = self._splice_micro_compact_result(messages, exchange_start, exchange_end, supersede=_cumulative)
+        # EREDMÉNY-KAPU (a méret-korlát helyett). Egy behajtás ÚJRAÍRJA a gördülő
+        # összefoglalót, és a modell hajlamos növelni: mérve 2026-10-08-án egy 70 tokenes
+        # váltás behajtása +700 tokent hozott KÖRÖNKÉNT. A helyes mérés nem a bemenet
+        # mérete (azt tippelni kell) és nem is a teljes kontextus (abba a marker egyszeri
+        # burkolója is beszámít, ami az ELSŐ behajtást mindig veszteségesnek mutatja),
+        # hanem: amennyit az ÖSSZEFOGLALÓ nőtt, szemben azzal, amennyit elvisz.
+        # Ha többel nőtt, visszaállunk — az összefoglalót IS, különben olyan váltást
+        # állítana magáról, ami szó szerint ott maradt (= duplikáció) —, és a kurzort
+        # léptetjük, hogy ne ugyanazon a váltáson pörögjünk minden fordulón.
+        # A MÉRT kontextus-változás a döntő — egy kivétellel: az első behajtás fizeti a
+        # marker egyszeri burkolóját (összefoglaló-fejléc + záró jel), ezért az mindig
+        # veszteségesnek mérné magát, és a funkció soha nem indulna el. A kivétel ahhoz
+        # kötődik, hogy van-e MÁR marker az átiratban (a burkoló ki van fizetve) — nem
+        # ahhoz, hogy van-e gördülő összefoglaló: újraélesztett szálon az összefoglaló
+        # megvan, de a marker még nincs, és akkor a burkoló valóban új költség.
+        # Steady state-ben a mérés dönt, és pont ott, ahol a körönkénti +700 tokenes
+        # szivárgást mértem 2026-10-08-án.
+        _tokens_after = estimate_messages_tokens_rough(result)
+        _summary_growth = (estimate_tokens_rough(updated_summary)
+                           - estimate_tokens_rough(_summary_before))
+        # A mérés CSAK a steady state-re szól: van már marker (a burkoló ki van fizetve) ÉS
+        # ezt a markert felülírjuk (`_cumulative`). Ha nem írjuk felül — újraélesztés után,
+        # amikor az összefoglalót nem lehetett visszanyerni —, egy ÚJ marker kerül be a régi
+        # mellé, és a növekedés szándékos: a nem átvitt történetet nem dobjuk el a méret
+        # kedvéért (tests/agent/test_micro_compaction.py::
+        # test_resume_keeps_the_old_marker_when_rehydration_fails).
+        _wrapper_paid = _cumulative and any(_is_micro_marker(m) for m in messages)
+        if _wrapper_paid and _tokens_after >= _tokens_before:
+            self._micro_compact_rolling_summary = _summary_before
+            self._micro_compact_cursor = exchange_end
+            _telemetry("skipped_no_gain", messages, tokens_after=_tokens_before,
+                       exchange_tokens=_exchange_tokens, summary_growth=_summary_growth)
+            return messages
         self._micro_compact_cursor = self._cursor_after_splice(result, exchange_start + 1)
         self._sync_micro_compact_to_db(result)
         _telemetry(

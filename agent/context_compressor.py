@@ -2712,7 +2712,10 @@ class ContextCompressor(SummaryDispatchMixin, MicroCompactionMixin, ContextEngin
         self._micro_compact_above_tokens: int = 0
         # Alsó korlát: ennél kisebb váltást nem foglalunk össze (az összefoglalója nagyobb
         # lenne, mint amit elvisz) — csak átlépjük.
-        self._micro_compact_min_exchange_tokens: int = 1500
+        # 0 = kikapcsolt elő-szűrő. A méret-alapú kihagyás 2026-10-09-én bizonyítottan
+        # kinullázta a funkciót (minden fordulón skipped_too_small, 20/35 teszt elhasalt);
+        # a kontextust most a behajtás utáni MÉRT eredmény-kapu védi (micro_compaction.py).
+        self._micro_compact_min_exchange_tokens: int = 0
         # Deferred: get_model_context_length() may issue a sync HTTP probe that must not block construction.
         # Floor and cap are applied on first resolution (see _resolve_context_length / threshold_tokens).
         # The small-context threshold floor and the absolute threshold cap both need the resolved window, so
