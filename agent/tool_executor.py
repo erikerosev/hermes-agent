@@ -822,7 +822,11 @@ def _resolve_sequential_tool_timeout() -> float | None:
 # one run).
 # ``manage_connections`` waits on the connection operation's own deadline; the generic deadline
 # would return tool_timeout while its approval card is still open.
-_SEQUENTIAL_DEADLINE_EXEMPT_TOOLS = frozenset({"delegate_task", "manage_connections"})
+# ``request_approval`` (Apollo) blocks on the human's push/control decision with its OWN capped
+# deadline (APOLLO_APPROVAL_MAX_TIMEOUT, 1500 s). Under the 420 s deadline every 600-900 s request
+# was killed at 7 min while the phone card stayed open: Erik's late approval reached no one, and the
+# kanban worker blocked itself as "denied" (measured 2026-10-11 18:21, 2026-10-12 23:27).
+_SEQUENTIAL_DEADLINE_EXEMPT_TOOLS = frozenset({"delegate_task", "manage_connections", "request_approval"})
 
 
 def _abandoned_sequential_result(agent, ref: _ToolCallRef, message: str, result_cls, **outcome) -> _ManagedToolResult:
